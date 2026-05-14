@@ -9,6 +9,7 @@ Channable → Shopify Auto-Sync
 Pricing (matches your existing store):
   Shopify selling price = Channable 'compare at price'
   Shopify compare-at    = Channable 'retail_price EUR'
+  Shopify cost per item = Channable 'wholesale_ EUR'
 """
 
 import os, sys, re, time, logging, requests, pandas as pd
@@ -51,9 +52,18 @@ def get_location_id():
     d = shopify("GET", "locations.json")
     return d["locations"][0]["id"] if d and d.get("locations") else None
 
-def set_inventory(iid, lid, qty):
-    shopify("POST", "inventory_levels/set.json",
-            {"location_id": lid, "inventory_item_id": iid, "available": int(qty)})
+def set_inventory(inventory_item_id, location_id, qty):
+    shopify("POST", "inventory_levels/set.json", {
+        "location_id":       location_id,
+        "inventory_item_id": inventory_item_id,
+        "available":         int(qty),
+    })
+
+def set_cost(inventory_item_id, cost):
+    """Set the 'Cost per item' field on a variant (stored on inventory_item)."""
+    if cost:
+        shopify("PUT", f"inventory_items/{inventory_item_id}.json",
+                {"inventory_item": {"id": inventory_item_id, "cost": str(cost)}})
 
 # ── Build map of already-synced products from Shopify tags ────────────────────
 
@@ -83,7 +93,7 @@ def fetch_channable():
         r = requests.get(CHANNABLE_URL, timeout=60); r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
         df.columns = df.columns.str.strip()
-        for c in ["wholesale_ EUR","compare at price","retail_price EUR","quantity"]:
+        for c in ["wholesale_ EUR", "compare at price", "retail_price EUR", "quantity"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df["quantity"] = df["quantity"].fillna(0).astype(int)
         active = df[df["quantity"] >= 1].copy()
@@ -115,14 +125,22 @@ def build_payload(group, igid):
     variants = []
     for _, row in group.iterrows():
         gtin = str(row.get("gtin","")).split(".")[0].strip()
-        v = {"sku": str(row["sku"]),
-             "price": f"{float(row['compare at price']):.2f}",
-             "compare_at_price": f"{float(row['retail_price EUR']):.2f}",
-             "barcode": gtin if gtin.lower()!="nan" else "",
-             "inventory_management": "shopify", "inventory_policy": "deny",
-             "taxable": True, "requires_shipping": True,
-             "_qty": int(row.get("quantity", 0)),
-             "option1": str(row.get("color" if multi_c else "size",""))}
+
+        # Wholesale price → stored separately on inventory_item after product creation
+        wholesale = row.get("wholesale_ EUR")
+        cost_val  = f"{float(wholesale):.2f}" if pd.notna(wholesale) and wholesale else None
+
+        v = {"sku":                  str(row["sku"]),
+             "price":                f"{float(row['compare at price']):.2f}",
+             "compare_at_price":     f"{float(row['retail_price EUR']):.2f}",
+             "barcode":              gtin if gtin.lower()!="nan" else "",
+             "inventory_management": "shopify",
+             "inventory_policy":     "deny",
+             "taxable":              True,
+             "requires_shipping":    True,
+             "_qty":                 int(row.get("quantity", 0)),
+             "_cost":                cost_val,
+             "option1":              str(row.get("color" if multi_c else "size",""))}
         if multi_c: v["option2"] = str(row.get("size",""))
         variants.append(v)
 
@@ -136,40 +154,68 @@ def build_payload(group, igid):
         str(first.get("vendor","")).upper().strip(),
         f"channable-{igid}"]))
 
-    return {"title": str(first["title"]), "body_html": html_desc(first.get("description","")),
-            "vendor": str(first["vendor"]).upper(), "product_type": str(first.get("sub_category","")),
-            "tags": tags, "status": "active", "options": options,
-            "variants": variants, "images": collect_images(group)}
+    return {"title":        str(first["title"]),
+            "body_html":    html_desc(first.get("description","")),
+            "vendor":       str(first["vendor"]).upper(),
+            "product_type": str(first.get("sub_category","")),
+            "tags":         tags,
+            "status":       "active",
+            "options":      options,
+            "variants":     variants,
+            "images":       collect_images(group)}
 
 # ── Create / Update ────────────────────────────────────────────────────────────
 
 def create_product(payload, lid):
-    qtys = {v["sku"]: v.pop("_qty", 0) for v in payload["variants"]}
+    # Strip internal keys before sending to Shopify
+    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+
     result = shopify("POST", "products.json", {"product": payload})
     if not result: return None
+
     p = result["product"]
     for var in p["variants"]:
-        qty = qtys.get(var.get("sku",""), 0)
+        sku  = var.get("sku", "")
+        qty  = qtys.get(sku, 0)
+        cost = costs.get(sku)
         if qty > 0 and lid: set_inventory(var["inventory_item_id"], lid, qty)
+        if cost:             set_cost(var["inventory_item_id"], cost)
         time.sleep(0.3)
+
     log.info(f"    ✅ CREATED  '{payload['title']}'  ({len(p['variants'])} variants)")
     return p["id"]
 
 def update_product(pid, payload, lid):
     existing = shopify("GET", f"products/{pid}.json")
     if existing is None: return "recreate"
-    ex = {v["sku"]: v for v in existing["product"].get("variants",[])}
-    qtys = {v["sku"]: v.pop("_qty", 0) for v in payload["variants"]}
+
+    ex    = {v["sku"]: v for v in existing["product"].get("variants",[])}
+    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+
     for v in payload["variants"]:
         if v["sku"] in ex: v["id"] = ex[v["sku"]]["id"]
+
     result = shopify("PUT", f"products/{pid}.json", {"product": {
-        "id": pid, "title": payload["title"], "body_html": payload["body_html"],
-        "vendor": payload["vendor"], "product_type": payload["product_type"],
-        "tags": payload["tags"], "variants": payload["variants"], "images": payload["images"]}})
+        "id":           pid,
+        "title":        payload["title"],
+        "body_html":    payload["body_html"],
+        "vendor":       payload["vendor"],
+        "product_type": payload["product_type"],
+        "tags":         payload["tags"],
+        "variants":     payload["variants"],
+        "images":       payload["images"]}})
+
     if not result: return False
+
     for var in result["product"]["variants"]:
-        if lid: set_inventory(var["inventory_item_id"], lid, qtys.get(var.get("sku",""), 0))
+        sku  = var.get("sku", "")
+        cost = costs.get(sku)
+        if lid:  set_inventory(var["inventory_item_id"], lid, qtys.get(sku, 0))
+        if cost: set_cost(var["inventory_item_id"], cost)
         time.sleep(0.2)
+
     log.info(f"    🔄 UPDATED  '{payload['title']}'")
     return True
 
@@ -189,8 +235,8 @@ def run():
     lid = get_location_id()
     if not lid: sys.exit(1)
 
-    groups = df.groupby("item_group_id")
-    total = len(groups)
+    groups  = df.groupby("item_group_id")
+    total   = len(groups)
     created = updated = errors = 0
 
     for i, (igid, group) in enumerate(groups, 1):
@@ -206,13 +252,13 @@ def run():
             if result == "recreate":
                 pid = create_product(payload, lid)
                 if pid: created += 1
-                else: errors += 1
+                else:   errors  += 1
             elif result: updated += 1
-            else: errors += 1
+            else:        errors  += 1
         else:
             pid = create_product(payload, lid)
             if pid: created += 1
-            else: errors += 1
+            else:   errors  += 1
 
         time.sleep(0.4)
 
