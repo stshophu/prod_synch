@@ -2,19 +2,55 @@
 """
 Channable → Shopify Auto-Sync
 ──────────────────────────────
-• Runs via GitHub Actions every hour (no server / no terminal needed)
+• Runs via GitHub Actions every hour
 • Groups size variants by item_group_id → one Shopify product each
-• Stateless: finds existing products via Shopify tags
+• Sets Shopify standardized category (taxonomy) from sub_category
+• Sets cost per item (wholesale price) on every variant
 
-Pricing (matches your existing store):
-  Shopify selling price = Channable 'compare at price'
-  Shopify compare-at    = Channable 'retail_price EUR'
+Pricing (margin-based, calculated from actual wholesale cost):
+  Shopify compare-at    = Channable 'retail_price EUR'  (RRP)
+  Shopify selling price = calculated for TARGET_MARGIN after VAT
   Shopify cost per item = Channable 'wholesale_ EUR'
 """
 
 import os, sys, re, time, logging, requests, pandas as pd
 from io import StringIO
 from datetime import datetime
+
+# ── Pricing configuration ──────────────────────────────────────────────────────
+TARGET_MARGIN    = 0.25   # 25% margin after VAT
+VAT_RATE         = 0.19   # 19% VAT
+MAX_DISC_DEFAULT = 0.45   # max 45% off RRP
+MAX_DISC_HALO    = 0.42   # max 42% off RRP (luxury halo brands)
+MAX_DISC_SHOE    = 0.35   # max 35% off RRP (shoes)
+
+HALO_BRANDS = {
+    "PRADA","GUCCI","MONCLER","BALENCIAGA","BOTTEGA VENETA","TOM FORD",
+    "BALMAIN","OFF-WHITE","BRUNELLO CUCINELLI","ALAIA","ALAÏA","VALENTINO",
+    "LOEWE","CELINE","CÉLINE","DIOR","CHRISTIAN DIOR","SAINT LAURENT",
+    "GIVENCHY","FENDI","VALENTINO GARAVANI",
+}
+SHOE_BRANDS = {
+    "CHRISTIAN LOUBOUTIN","LOUBOUTIN","JIMMY CHOO","GIANVITO ROSSI",
+    "SERGIO ROSSI","GIUSEPPE ZANOTTI","MANOLO BLAHNIK","AQUAZZURA",
+}
+
+def calc_selling_price(wholesale, rrp, vendor=""):
+    """Calculate correct selling price from actual wholesale cost and RRP."""
+    if not wholesale or not rrp or rrp <= 0 or wholesale <= 0:
+        return None
+    v = vendor.upper()
+    if any(b in v for b in HALO_BRANDS):
+        max_disc = MAX_DISC_HALO
+    elif any(b in v for b in SHOE_BRANDS):
+        max_disc = MAX_DISC_SHOE
+    else:
+        max_disc = MAX_DISC_DEFAULT
+    min_price = wholesale * (1 + VAT_RATE) / (1 - TARGET_MARGIN)
+    floor     = rrp * (1 - max_disc)
+    new       = max(min_price, floor)
+    new       = min(new, rrp * 0.90)
+    return round(new / 5) * 5 or round(min_price / 5) * 5
 
 CHANNABLE_URL = os.getenv("CHANNABLE_URL",
     "https://files.channable.com/p3c5dKKrUlPQZVH_aBglWA==.csv")
@@ -41,7 +77,7 @@ def shopify(method, path, body=None, retries=4):
                 time.sleep(int(r.headers.get("Retry-After", 5))); continue
             if r.status_code == 404: return None
             if r.status_code in (200, 201): return r.json()
-            log.error(f"  Shopify {r.status_code}: {r.text[:200]}")
+            log.error(f"  Shopify {r.status_code} on {method} {path}: {r.text[:200]}")
             return None
         except requests.RequestException as e:
             log.warning(f"  Network error (attempt {attempt+1}): {e}")
@@ -52,20 +88,108 @@ def get_location_id():
     d = shopify("GET", "locations.json")
     return d["locations"][0]["id"] if d and d.get("locations") else None
 
-def set_inventory(inventory_item_id, location_id, qty):
-    shopify("POST", "inventory_levels/set.json", {
-        "location_id":       location_id,
-        "inventory_item_id": inventory_item_id,
-        "available":         int(qty),
-    })
+def set_inventory(iid, lid, qty):
+    r = shopify("POST", "inventory_levels/set.json",
+                {"location_id": lid, "inventory_item_id": iid, "available": int(qty)})
+    if not r:
+        log.warning(f"  ⚠️  Failed to set inventory for item {iid}")
 
 def set_cost(inventory_item_id, cost):
-    """Set the 'Cost per item' field on a variant (stored on inventory_item)."""
-    if cost:
-        shopify("PUT", f"inventory_items/{inventory_item_id}.json",
+    """Set 'Cost per item' (wholesale price) on a variant's inventory item."""
+    if not cost:
+        return
+    r = shopify("PUT", f"inventory_items/{inventory_item_id}.json",
                 {"inventory_item": {"id": inventory_item_id, "cost": str(cost)}})
+    if not r:
+        log.warning(f"  ⚠️  Failed to set cost for inventory item {inventory_item_id} "
+                    f"— check that 'write_inventory' scope is enabled on your Shopify app token")
 
-# ── Build map of already-synced products from Shopify tags ────────────────────
+# ── Product taxonomy (Shopify standardized categories) ────────────────────────
+
+# Maps Channable sub_category → search keywords in Shopify taxonomy names
+_CATEGORY_KEYWORDS = {
+    "jacket":       ["jacket"],
+    "coat":         ["coat"],
+    "vest":         ["vest"],
+    "gilet":        ["vest"],
+    "dress":        ["dress"],
+    "pants":        ["pants"],
+    "trousers":     ["pants"],
+    "joggers":      ["pants"],
+    "sweatpants":   ["pants"],
+    "shorts":       ["shorts"],
+    "skirt":        ["skirt"],
+    "sweater":      ["sweater"],
+    "pullover":     ["sweater"],
+    "cardigan":     ["cardigan"],
+    "sweatshirt":   ["sweatshirt", "hoodie"],
+    "t-shirt":      ["t-shirt"],
+    "t-shirt set":  ["t-shirt"],
+    "shirt":        ["shirt"],
+    "polo":         ["polo"],
+    "top":          ["top"],
+    "blazer":       ["blazer"],
+    "jeans":        ["jeans"],
+    "bag":          ["handbag"],
+    "tote":         ["handbag"],
+    "shoulder bag": ["shoulder bag", "handbag"],
+    "loafers":      ["loafer"],
+    "shoes":        ["shoes"],
+    "sneakers":     ["sneaker"],
+    "boots":        ["boot"],
+    "scarf":        ["scarf"],
+    "cap":          ["hat"],
+    "swimsuit":     ["swimsuit", "swimwear"],
+    "bracelet":     ["bracelet"],
+    "earrings":     ["earring"],
+    "wallet":       ["wallet"],
+    "card holder":  ["wallet", "card"],
+    "belt":         ["belt"],
+    "turtleneck":   ["sweater"],
+    "jumper":       ["sweater"],
+}
+
+_taxonomy_cache = None
+
+def load_taxonomy():
+    """Fetch Shopify's full product taxonomy once and cache it."""
+    global _taxonomy_cache
+    if _taxonomy_cache is not None:
+        return _taxonomy_cache
+    _taxonomy_cache = {}
+    log.info("  Loading Shopify product taxonomy…")
+    try:
+        r = S.get(
+            f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VER}/product_categories.json?limit=250",
+            timeout=30)
+        if r.status_code == 200:
+            for cat in r.json().get("product_categories", []):
+                # Index by both short name and full hierarchical name
+                _taxonomy_cache[cat["name"].lower()] = cat["id"]
+                full = cat.get("full_name", "")
+                if full:
+                    _taxonomy_cache[full.lower()] = cat["id"]
+            log.info(f"  Loaded {len(_taxonomy_cache)} taxonomy entries")
+        else:
+            log.warning(f"  Could not load taxonomy ({r.status_code}) — categories will be skipped")
+    except Exception as e:
+        log.warning(f"  Taxonomy fetch failed: {e}")
+    return _taxonomy_cache
+
+def get_category_id(sub_category):
+    """Return a Shopify taxonomy node ID for a given sub_category string."""
+    taxonomy = load_taxonomy()
+    if not taxonomy:
+        return None
+    sub = sub_category.strip().lower()
+    keywords = _CATEGORY_KEYWORDS.get(sub, [sub])
+    for kw in keywords:
+        for name, tid in taxonomy.items():
+            if kw in name:
+                return tid
+    return None
+
+# ── Build existing-product map from Shopify tags ──────────────────────────────
 
 def build_existing_map():
     log.info("  Scanning Shopify for previously-synced products…")
@@ -103,7 +227,7 @@ def fetch_channable():
         log.error(f"Feed fetch failed: {e}"); return None
 
 def html_desc(raw):
-    if not raw or str(raw).strip().lower() in ("nan",""):  return ""
+    if not raw or str(raw).strip().lower() in ("nan",""): return ""
     parts = [p.strip("- ").strip() for p in str(raw).split(" - ") if p.strip("- ").strip()]
     return "<ul>"+"".join(f"<li>{p}</li>" for p in parts)+"</ul>" if parts else str(raw)
 
@@ -121,17 +245,26 @@ def build_payload(group, igid):
     colors  = list(group["color"].dropna().unique())
     sizes   = list(group["size"].dropna().astype(str).unique())
     multi_c = len(colors) > 1
+    sub_cat = str(first.get("sub_category", "")).strip()
 
     variants = []
     for _, row in group.iterrows():
         gtin = str(row.get("gtin","")).split(".")[0].strip()
 
-        # Wholesale price → stored separately on inventory_item after product creation
         wholesale = row.get("wholesale_ EUR")
+        rrp       = row.get("retail_price EUR")
+        vendor    = str(first.get("vendor",""))
         cost_val  = f"{float(wholesale):.2f}" if pd.notna(wholesale) and wholesale else None
 
+        # Calculate selling price from actual cost + margin formula
+        calc_price = None
+        if pd.notna(wholesale) and wholesale and pd.notna(rrp) and rrp:
+            calc_price = calc_selling_price(float(wholesale), float(rrp), vendor)
+        # Fallback to Channable's suggested price if formula fails
+        selling_price = calc_price or float(row.get("compare at price", 0) or 0)
+
         v = {"sku":                  str(row["sku"]),
-             "price":                f"{float(row['compare at price']):.2f}",
+             "price":                f"{selling_price:.2f}",
              "compare_at_price":     f"{float(row['retail_price EUR']):.2f}",
              "barcode":              gtin if gtin.lower()!="nan" else "",
              "inventory_management": "shopify",
@@ -149,25 +282,47 @@ def build_payload(group, igid):
 
     tags = ", ".join(filter(None, [
         str(first.get("category","")).strip(),
-        str(first.get("sub_category","")).strip(),
+        sub_cat,
         str(first.get("gender","")).strip(),
         str(first.get("vendor","")).upper().strip(),
         f"channable-{igid}"]))
 
-    return {"title":        str(first["title"]),
-            "body_html":    html_desc(first.get("description","")),
-            "vendor":       str(first["vendor"]).upper(),
-            "product_type": str(first.get("sub_category","")),
-            "tags":         tags,
-            "status":       "active",
-            "options":      options,
-            "variants":     variants,
-            "images":       collect_images(group)}
+    payload = {
+        "title":        str(first["title"]),
+        "body_html":    html_desc(first.get("description","")),
+        "vendor":       str(first["vendor"]).upper(),
+        "product_type": sub_cat,
+        "tags":         tags,
+        "status":       "active",
+        "options":      options,
+        "variants":     variants,
+        "images":       collect_images(group),
+    }
+
+    # Shopify standardized category (taxonomy)
+    cat_id = get_category_id(sub_cat)
+    if cat_id:
+        payload["product_category"] = {"product_taxonomy_node_id": cat_id}
+
+    return payload
 
 # ── Create / Update ────────────────────────────────────────────────────────────
 
+def _apply_variant_extras(variants_response, qtys, costs, lid):
+    """Set inventory quantity and cost per item for each variant."""
+    for var in variants_response:
+        sku  = var.get("sku", "")
+        iid  = var["inventory_item_id"]
+        qty  = qtys.get(sku, 0)
+        cost = costs.get(sku)
+
+        if lid:
+            set_inventory(iid, lid, qty)
+        if cost:
+            set_cost(iid, cost)
+        time.sleep(0.25)
+
 def create_product(payload, lid):
-    # Strip internal keys before sending to Shopify
     qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
     costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
 
@@ -175,14 +330,7 @@ def create_product(payload, lid):
     if not result: return None
 
     p = result["product"]
-    for var in p["variants"]:
-        sku  = var.get("sku", "")
-        qty  = qtys.get(sku, 0)
-        cost = costs.get(sku)
-        if qty > 0 and lid: set_inventory(var["inventory_item_id"], lid, qty)
-        if cost:             set_cost(var["inventory_item_id"], cost)
-        time.sleep(0.3)
-
+    _apply_variant_extras(p["variants"], qtys, costs, lid)
     log.info(f"    ✅ CREATED  '{payload['title']}'  ({len(p['variants'])} variants)")
     return p["id"]
 
@@ -205,17 +353,13 @@ def update_product(pid, payload, lid):
         "product_type": payload["product_type"],
         "tags":         payload["tags"],
         "variants":     payload["variants"],
-        "images":       payload["images"]}})
+        "images":       payload["images"],
+        **({"product_category": payload["product_category"]}
+           if "product_category" in payload else {}),
+    }})
 
     if not result: return False
-
-    for var in result["product"]["variants"]:
-        sku  = var.get("sku", "")
-        cost = costs.get(sku)
-        if lid:  set_inventory(var["inventory_item_id"], lid, qtys.get(sku, 0))
-        if cost: set_cost(var["inventory_item_id"], cost)
-        time.sleep(0.2)
-
+    _apply_variant_extras(result["product"]["variants"], qtys, costs, lid)
     log.info(f"    🔄 UPDATED  '{payload['title']}'")
     return True
 
@@ -234,6 +378,9 @@ def run():
     product_map = build_existing_map()
     lid = get_location_id()
     if not lid: sys.exit(1)
+
+    # Pre-load taxonomy so it's ready (avoids repeated fetches)
+    load_taxonomy()
 
     groups  = df.groupby("item_group_id")
     total   = len(groups)
