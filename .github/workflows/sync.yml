@@ -25,6 +25,7 @@ jobs:
 
       - name: Run sync
         env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_STORE: siebentaschen.myshopify.com
           CHANNABLE_URL: https://files.channable.com/p3c5dKKrUlPQZVH_aBglWA==.csv
