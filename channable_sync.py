@@ -128,27 +128,14 @@ def set_inventory(iid, lid, qty):
     if not r:
         log.warning(f"  ⚠️  Failed to set inventory for item {iid}")
 
-def get_existing_cost(inventory_item_id):
-    """Get the current cost set on an inventory item."""
-    r = shopify("GET", f"inventory_items/{inventory_item_id}.json")
-    if r and r.get("inventory_item"):
-        return r["inventory_item"].get("cost")
-    return None
-
 def set_cost(inventory_item_id, cost):
-    """Set 'Cost per item' only if not already manually set."""
+    """Set 'Cost per item' (wholesale price) on a variant's inventory item."""
     if not cost:
-        return
-    # Check existing cost — don't overwrite if already set
-    existing = get_existing_cost(inventory_item_id)
-    if existing:
-        log.info(f"  ℹ️  Cost already set (€{existing}) — keeping manual value")
         return
     r = shopify("PUT", f"inventory_items/{inventory_item_id}.json",
                 {"inventory_item": {"id": inventory_item_id, "cost": str(cost)}})
     if not r:
-        log.warning(f"  ⚠️  Failed to set cost for inventory item {inventory_item_id} "
-                    f"— check that 'write_inventory' scope is enabled on your Shopify app token")
+        log.warning(f"  ⚠️  Failed to set cost for inventory item {inventory_item_id}")
 
 # ── Product taxonomy (Shopify standardized categories) ────────────────────────
 
@@ -366,49 +353,29 @@ def build_payload(group, igid):
 
 # ── Create / Update ────────────────────────────────────────────────────────────
 
-def _apply_variant_extras(variants_response, qtys, costs, feed_prices, vendor, lid):
-    """Set inventory quantity, cost, and recalculate price if manual cost exists."""
+def _apply_variant_extras(variants_response, qtys, costs, lid):
+    """Set inventory quantity and cost per item for each variant."""
     for var in variants_response:
         sku  = var.get("sku", "")
         iid  = var["inventory_item_id"]
-        vid  = var["id"]
         qty  = qtys.get(sku, 0)
-        feed_cost = costs.get(sku)
-
+        cost = costs.get(sku)
         if lid:
             set_inventory(iid, lid, qty)
-
-        if feed_cost:
-            existing_cost = get_existing_cost(iid)
-            if existing_cost:
-                # Manual cost exists — use it for pricing instead of feed cost
-                manual_cost = float(existing_cost)
-                feed_price_data = feed_prices.get(sku, {})
-                rrp = feed_price_data.get("rrp", 0)
-                if rrp and manual_cost != float(feed_cost):
-                    # Recalculate price using manual cost
-                    new_price = calc_selling_price(manual_cost, rrp, vendor)
-                    if new_price:
-                        shopify("PUT", f"variants/{vid}.json",
-                                {"variant": {"id": vid, "price": f"{new_price:.2f}"}})
-                        log.info(f"  💰 Repriced with manual cost: €{manual_cost} → €{new_price}")
-                log.info(f"  ℹ️  Cost already set (€{existing_cost}) — keeping manual value")
-            else:
-                set_cost(iid, feed_cost)
-
+        if cost:
+            set_cost(iid, cost)
         time.sleep(0.25)
 
 def create_product(payload, lid):
-    qtys        = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
-    costs       = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
-    feed_prices = {v["sku"]: v.pop("_feed", {})   for v in payload["variants"]}
-    vendor      = payload.get("vendor", "")
+    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    for v in payload["variants"]: v.pop("_feed", None)
 
     result = shopify("POST", "products.json", {"product": payload})
     if not result: return None
 
     p = result["product"]
-    _apply_variant_extras(p["variants"], qtys, costs, feed_prices, vendor, lid)
+    _apply_variant_extras(p["variants"], qtys, costs, lid)
     log.info(f"    ✅ CREATED  '{payload['title']}'  ({len(p['variants'])} variants)")
     return p["id"]
 
@@ -416,11 +383,10 @@ def update_product(pid, payload, lid):
     existing = shopify("GET", f"products/{pid}.json")
     if existing is None: return "recreate"
 
-    ex          = {v["sku"]: v for v in existing["product"].get("variants",[])}
-    qtys        = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
-    costs       = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
-    feed_prices = {v["sku"]: v.pop("_feed", {})   for v in payload["variants"]}
-    vendor      = payload.get("vendor", "")
+    ex    = {v["sku"]: v for v in existing["product"].get("variants",[])}
+    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    for v in payload["variants"]: v.pop("_feed", None)
 
     for v in payload["variants"]:
         if v["sku"] in ex: v["id"] = ex[v["sku"]]["id"]
@@ -439,7 +405,7 @@ def update_product(pid, payload, lid):
     }})
 
     if not result: return False
-    _apply_variant_extras(result["product"]["variants"], qtys, costs, feed_prices, vendor, lid)
+    _apply_variant_extras(result["product"]["variants"], qtys, costs, lid)
     log.info(f"    🔄 UPDATED  '{payload['title']}'")
     return True
 
