@@ -238,7 +238,7 @@ def build_existing_map():
                     product_map[t[len("channable-"):]] = p["id"]; break
         m = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', r.headers.get("Link",""))
         path = f"products.json?limit=250&fields=id,tags&page_info={m.group(1)}" if m else None
-        time.sleep(0.3)
+        time.sleep(0.1)
     log.info(f"  Found {len(product_map)} previously synced")
     return product_map
 
@@ -364,7 +364,7 @@ def _apply_variant_extras(variants_response, qtys, costs, lid):
             set_inventory(iid, lid, qty)
         if cost:
             set_cost(iid, cost)
-        time.sleep(0.25)
+        time.sleep(0.1)
 
 def create_product(payload, lid):
     qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
@@ -398,8 +398,9 @@ def update_product(pid, payload, lid):
         "vendor":       payload["vendor"],
         "product_type": payload["product_type"],
         "tags":         payload["tags"],
+        "status":       payload.get("status","active"),
         "variants":     payload["variants"],
-        "images":       payload["images"],
+        # Skip images on update — they rarely change and save API time
         **({"product_category": payload["product_category"]}
            if "product_category" in payload else {}),
     }})
@@ -453,7 +454,7 @@ def run():
             if pid: created += 1
             else:   errors  += 1
 
-        time.sleep(0.4)
+        time.sleep(0.15)
 
     log.info(f"\n  ✅  {created} created · {updated} updated · {errors} errors")
     log.info("═"*55)
