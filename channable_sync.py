@@ -35,22 +35,56 @@ SHOE_BRANDS = {
     "SERGIO ROSSI","GIUSEPPE ZANOTTI","MANOLO BLAHNIK","AQUAZZURA",
 }
 
-def calc_selling_price(wholesale, rrp, vendor=""):
-    """Calculate correct selling price from actual wholesale cost and RRP."""
+MIN_ACCEPTABLE_MARGIN = 0.10  # below this → unpublish + tag 'review-margin'
+LOW_MARGIN_THRESHOLD  = 0.25  # below this but above min → sell at RRP, tag 'low-margin'
+
+def calc_eu_margin(price, wholesale, vat=VAT_RATE):
+    """Actual margin after VAT."""
+    if not price or not wholesale: return 0
+    return (price / (1 + vat) - wholesale) / (price / (1 + vat))
+
+def price_decision(wholesale, rrp, vendor=""):
+    """
+    Returns (price, status, tag) where:
+      status: 'ok' | 'low-margin' | 'review-margin'
+      tag:    tag to add to product, or None
+    """
     if not wholesale or not rrp or rrp <= 0 or wholesale <= 0:
-        return None
+        return None, 'ok', None
+
     v = vendor.upper()
-    if any(b in v for b in HALO_BRANDS):
-        max_disc = MAX_DISC_HALO
-    elif any(b in v for b in SHOE_BRANDS):
-        max_disc = MAX_DISC_SHOE
-    else:
-        max_disc = MAX_DISC_DEFAULT
-    min_price = wholesale * (1 + VAT_RATE) / (1 - TARGET_MARGIN)
-    floor     = rrp * (1 - max_disc)
-    new       = max(min_price, floor)
-    new       = min(new, rrp * 0.90)
-    return round(new / 5) * 5 or round(min_price / 5) * 5
+    if any(b in v for b in HALO_BRANDS):   max_disc = MAX_DISC_HALO
+    elif any(b in v for b in SHOE_BRANDS): max_disc = MAX_DISC_SHOE
+    else:                                   max_disc = MAX_DISC_DEFAULT
+
+    # Minimum price for target margin after VAT
+    min_viable = wholesale * (1 + VAT_RATE) / (1 - TARGET_MARGIN)
+    # Minimum price for minimum acceptable margin
+    min_acceptable = wholesale * (1 + VAT_RATE) / (1 - MIN_ACCEPTABLE_MARGIN)
+    # Competitive floor
+    floor = rrp * (1 - max_disc)
+
+    # Case 1: Even RRP doesn't cover minimum acceptable margin
+    # → unpublish, tag review-margin
+    if min_acceptable > rrp:
+        margin_at_rrp = calc_eu_margin(rrp, wholesale)
+        log.warning(f"  ⚠️  Margin at RRP only {margin_at_rrp:.0%} — flagging for review")
+        return rrp, 'review-margin', 'review-margin'
+
+    # Case 2: Can't hit target margin without going above RRP
+    # → sell at RRP, tag low-margin
+    if min_viable > rrp:
+        return rrp, 'low-margin', 'low-margin'
+
+    # Case 3: Normal — apply margin formula with discount
+    price = max(min_viable, floor)
+    price = min(price, rrp * 0.95)  # max 5% discount shown (keeps it looking premium)
+    return round(price / 5) * 5 or round(min_viable / 5) * 5, 'ok', None
+
+# Keep backward-compatible wrapper
+def calc_selling_price(wholesale, rrp, vendor=""):
+    price, _, _ = price_decision(wholesale, rrp, vendor)
+    return price
 
 CHANNABLE_URL = os.getenv("CHANNABLE_URL",
     "https://files.channable.com/p3c5dKKrUlPQZVH_aBglWA==.csv")
@@ -94,9 +128,21 @@ def set_inventory(iid, lid, qty):
     if not r:
         log.warning(f"  ⚠️  Failed to set inventory for item {iid}")
 
+def get_existing_cost(inventory_item_id):
+    """Get the current cost set on an inventory item."""
+    r = shopify("GET", f"inventory_items/{inventory_item_id}.json")
+    if r and r.get("inventory_item"):
+        return r["inventory_item"].get("cost")
+    return None
+
 def set_cost(inventory_item_id, cost):
-    """Set 'Cost per item' (wholesale price) on a variant's inventory item."""
+    """Set 'Cost per item' only if not already manually set."""
     if not cost:
+        return
+    # Check existing cost — don't overwrite if already set
+    existing = get_existing_cost(inventory_item_id)
+    if existing:
+        log.info(f"  ℹ️  Cost already set (€{existing}) — keeping manual value")
         return
     r = shopify("PUT", f"inventory_items/{inventory_item_id}.json",
                 {"inventory_item": {"id": inventory_item_id, "cost": str(cost)}})
@@ -246,22 +292,30 @@ def build_payload(group, igid):
     sizes   = list(group["size"].dropna().astype(str).unique())
     multi_c = len(colors) > 1
     sub_cat = str(first.get("sub_category", "")).strip()
+    vendor  = str(first.get("vendor",""))
 
     variants = []
+    product_status = "active"
+    margin_tag = None
+
     for _, row in group.iterrows():
         gtin = str(row.get("gtin","")).split(".")[0].strip()
 
         wholesale = row.get("wholesale_ EUR")
         rrp       = row.get("retail_price EUR")
-        vendor    = str(first.get("vendor",""))
         cost_val  = f"{float(wholesale):.2f}" if pd.notna(wholesale) and wholesale else None
 
-        # Calculate selling price from actual cost + margin formula
-        calc_price = None
+        # Use margin-aware pricing decision
+        selling_price = float(row.get("compare at price", 0) or 0)  # fallback
         if pd.notna(wholesale) and wholesale and pd.notna(rrp) and rrp:
-            calc_price = calc_selling_price(float(wholesale), float(rrp), vendor)
-        # Fallback to Channable's suggested price if formula fails
-        selling_price = calc_price or float(row.get("compare at price", 0) or 0)
+            price, status, tag = price_decision(float(wholesale), float(rrp), vendor)
+            if price:
+                selling_price = price
+            if status == 'review-margin':
+                product_status = "draft"  # unpublish
+                margin_tag = "review-margin"
+            elif status == 'low-margin' and margin_tag != 'review-margin':
+                margin_tag = "low-margin"
 
         v = {"sku":                  str(row["sku"]),
              "price":                f"{selling_price:.2f}",
@@ -273,6 +327,7 @@ def build_payload(group, igid):
              "requires_shipping":    True,
              "_qty":                 int(row.get("quantity", 0)),
              "_cost":                cost_val,
+             "_feed":                {"rrp": float(rrp) if pd.notna(rrp) and rrp else 0},
              "option1":              str(row.get("color" if multi_c else "size",""))}
         if multi_c: v["option2"] = str(row.get("size",""))
         variants.append(v)
@@ -280,20 +335,23 @@ def build_payload(group, igid):
     options = ([{"name":"Color","values":colors},{"name":"Size","values":sizes}]
                if multi_c else [{"name":"Size","values":sizes}])
 
-    tags = ", ".join(filter(None, [
+    tag_parts = [
         str(first.get("category","")).strip(),
         sub_cat,
         str(first.get("gender","")).strip(),
-        str(first.get("vendor","")).upper().strip(),
-        f"channable-{igid}"]))
+        vendor.upper().strip(),
+        f"channable-{igid}",
+        margin_tag,  # 'review-margin', 'low-margin', or None
+    ]
+    tags = ", ".join(filter(None, tag_parts))
 
     payload = {
         "title":        str(first["title"]),
         "body_html":    html_desc(first.get("description","")),
-        "vendor":       str(first["vendor"]).upper(),
+        "vendor":       vendor.upper(),
         "product_type": sub_cat,
         "tags":         tags,
-        "status":       "active",
+        "status":       product_status,  # 'draft' if review-margin, else 'active'
         "options":      options,
         "variants":     variants,
         "images":       collect_images(group),
@@ -308,29 +366,49 @@ def build_payload(group, igid):
 
 # ── Create / Update ────────────────────────────────────────────────────────────
 
-def _apply_variant_extras(variants_response, qtys, costs, lid):
-    """Set inventory quantity and cost per item for each variant."""
+def _apply_variant_extras(variants_response, qtys, costs, feed_prices, vendor, lid):
+    """Set inventory quantity, cost, and recalculate price if manual cost exists."""
     for var in variants_response:
         sku  = var.get("sku", "")
         iid  = var["inventory_item_id"]
+        vid  = var["id"]
         qty  = qtys.get(sku, 0)
-        cost = costs.get(sku)
+        feed_cost = costs.get(sku)
 
         if lid:
             set_inventory(iid, lid, qty)
-        if cost:
-            set_cost(iid, cost)
+
+        if feed_cost:
+            existing_cost = get_existing_cost(iid)
+            if existing_cost:
+                # Manual cost exists — use it for pricing instead of feed cost
+                manual_cost = float(existing_cost)
+                feed_price_data = feed_prices.get(sku, {})
+                rrp = feed_price_data.get("rrp", 0)
+                if rrp and manual_cost != float(feed_cost):
+                    # Recalculate price using manual cost
+                    new_price = calc_selling_price(manual_cost, rrp, vendor)
+                    if new_price:
+                        shopify("PUT", f"variants/{vid}.json",
+                                {"variant": {"id": vid, "price": f"{new_price:.2f}"}})
+                        log.info(f"  💰 Repriced with manual cost: €{manual_cost} → €{new_price}")
+                log.info(f"  ℹ️  Cost already set (€{existing_cost}) — keeping manual value")
+            else:
+                set_cost(iid, feed_cost)
+
         time.sleep(0.25)
 
 def create_product(payload, lid):
-    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
-    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    qtys        = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs       = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    feed_prices = {v["sku"]: v.pop("_feed", {})   for v in payload["variants"]}
+    vendor      = payload.get("vendor", "")
 
     result = shopify("POST", "products.json", {"product": payload})
     if not result: return None
 
     p = result["product"]
-    _apply_variant_extras(p["variants"], qtys, costs, lid)
+    _apply_variant_extras(p["variants"], qtys, costs, feed_prices, vendor, lid)
     log.info(f"    ✅ CREATED  '{payload['title']}'  ({len(p['variants'])} variants)")
     return p["id"]
 
@@ -338,9 +416,11 @@ def update_product(pid, payload, lid):
     existing = shopify("GET", f"products/{pid}.json")
     if existing is None: return "recreate"
 
-    ex    = {v["sku"]: v for v in existing["product"].get("variants",[])}
-    qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
-    costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    ex          = {v["sku"]: v for v in existing["product"].get("variants",[])}
+    qtys        = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
+    costs       = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
+    feed_prices = {v["sku"]: v.pop("_feed", {})   for v in payload["variants"]}
+    vendor      = payload.get("vendor", "")
 
     for v in payload["variants"]:
         if v["sku"] in ex: v["id"] = ex[v["sku"]]["id"]
@@ -359,7 +439,7 @@ def update_product(pid, payload, lid):
     }})
 
     if not result: return False
-    _apply_variant_extras(result["product"]["variants"], qtys, costs, lid)
+    _apply_variant_extras(result["product"]["variants"], qtys, costs, feed_prices, vendor, lid)
     log.info(f"    🔄 UPDATED  '{payload['title']}'")
     return True
 
