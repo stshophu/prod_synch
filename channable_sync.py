@@ -108,7 +108,7 @@ def shopify(method, path, body=None, retries=4):
             used, cap = (int(x) for x in r.headers.get("X-Shopify-Shop-Api-Call-Limit","0/40").split("/"))
             if used >= cap - 5: time.sleep(2)
             if r.status_code == 429:
-                time.sleep(int(r.headers.get("Retry-After", 5))); continue
+                time.sleep(int(float(r.headers.get("Retry-After", 5)))); continue
             if r.status_code == 404: return None
             if r.status_code in (200, 201): return r.json()
             log.error(f"  Shopify {r.status_code} on {method} {path}: {r.text[:200]}")
