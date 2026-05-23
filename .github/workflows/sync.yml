@@ -23,5 +23,5 @@ jobs:
         env:
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_STORE: siebentaschen.myshopify.com
-          CHANNABLE_URL: https://files.channable.com/p3c5dKKrUlPQZVH_aBglWA==.csv
+          CHANNABLE_URL: ${{ secrets.CHANNABLE_URL }}
         run: python channable_sync.py
