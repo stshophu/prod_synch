@@ -226,10 +226,37 @@ def get_category_id(sub_category):
 def build_existing_map():
     log.info("  Scanning Shopify for previously-synced products…")
     product_map, path = {}, "products.json?limit=250&fields=id,tags"
+    pages = 0
     while path:
         full = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VER}/{path}"
-        r = S.get(full, timeout=30)
-        if r.status_code != 200: break
+        r = None
+        for attempt in range(6):
+            try:
+                r = S.get(full, timeout=30)
+            except requests.RequestException as e:
+                log.warning(f"  Network error scanning products (attempt {attempt+1}): {e}")
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", 5))
+                log.warning(f"  Rate limited while scanning products, waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if r.status_code >= 500:
+                log.warning(f"  Shopify {r.status_code} scanning products, retrying")
+                time.sleep(2 ** attempt)
+                continue
+            break  # got a real response (2xx or a non-retryable error)
+        if r is None or r.status_code != 200:
+            # Do NOT silently return a partial map — a partial map here is what
+            # causes every product past this point to look "never synced" on
+            # EVERY run, which recreates duplicates forever. Fail loudly instead.
+            log.error(f"  Failed to fully scan existing products (status "
+                      f"{r.status_code if r is not None else 'no response'}) "
+                      f"after {pages} pages / {len(product_map)} tags collected. "
+                      f"Aborting sync rather than risk mass duplicate creation.")
+            sys.exit(1)
+        pages += 1
         for p in r.json().get("products", []):
             for tag in p.get("tags", "").split(","):
                 t = tag.strip()
@@ -237,8 +264,8 @@ def build_existing_map():
                     product_map[t[len("channable-"):]] = p["id"]; break
         m = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', r.headers.get("Link",""))
         path = f"products.json?limit=250&fields=id,tags&page_info={m.group(1)}" if m else None
-        time.sleep(0.1)
-    log.info(f"  Found {len(product_map)} previously synced")
+        time.sleep(0.5)  # was 0.1 — too fast for REST limit, contributed to the 429s
+    log.info(f"  Scanned {pages} pages · found {len(product_map)} previously synced")
     return product_map
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
