@@ -1,0 +1,40 @@
+name: Channable → Shopify Sync (daily · full)
+on:
+  schedule:
+    - cron: '0 3 * * *'   # once a day, 03:00 UTC — adjust to your lowest-traffic hour
+  workflow_dispatch:        # also lets you click "Run workflow" manually in GitHub
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Full run does creates + full-field updates for ~1,100 products, so it
+    # needs much more headroom than the hourly fast pass. Monitor the first
+    # few runs in the Actions tab and adjust this if it's consistently
+    # finishing with a lot of room to spare, or cutting it close.
+    timeout-minutes: 300
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run sync (full — creates + complete field sync)
+        env:
+          SYNC_MODE: full
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: siebentaschen.myshopify.com
+          CHANNABLE_URL: ${{ secrets.CHANNABLE_URL }}
+          TARGET_MARGIN: ${{ secrets.TARGET_MARGIN }}
+          VAT_RATE: ${{ secrets.VAT_RATE }}
+          MAX_DISC_DEFAULT: ${{ secrets.MAX_DISC_DEFAULT }}
+          MAX_DISC_HALO: ${{ secrets.MAX_DISC_HALO }}
+          MAX_DISC_SHOE: ${{ secrets.MAX_DISC_SHOE }}
+          MIN_ACCEPTABLE_MARGIN: ${{ secrets.MIN_ACCEPTABLE_MARGIN }}
+          HALO_BRANDS: ${{ secrets.HALO_BRANDS }}
+          SHOE_BRANDS: ${{ secrets.SHOE_BRANDS }}
+        run: python channable_sync.py
