@@ -17,6 +17,44 @@ import os, sys, re, time, logging, requests, pandas as pd
 from io import StringIO
 from datetime import datetime
 
+# ── Category-based weight defaults ────────────────────────────────────────────
+# Kept in sync with backfill_weights.py / weight_defaults.py
+# ORDER MATTERS: first match wins (checked against product_type then title).
+_WEIGHT_RULES = [
+    (("parka", "down jacket", "puffer", "coat"), 2.5),
+    (("suit",), 1.8),
+    (("gilet", "vest", "windbreaker"), 1.0),
+    (("jacket", "blazer", "bomber", "biker"), 1.5),
+    (("boot",), 2.0),
+    (("sneaker", "trainer"), 1.5),
+    (("flats", "sandal", "pump", "heel", "loafer", "oxford", "derb",
+      "slipper", "mule", "slide", "espadrille", "slip-on", "slip on", "shoe"), 1.2),
+    (("clutch", "pouch", "purse", "mini bag"), 1.0),
+    (("bag", "backpack", "tote", "handbag"), 1.5),
+    (("wallet", "cardholder", "card holder", "keyring", "key holder", "case"), 0.5),
+    (("belt",), 0.6),
+    (("sunglass", "eyewear", "glasses"), 0.5),
+    (("bow tie", "pocket square", "necktie", "ties", "tie "), 0.3),
+    (("scarf", "glove", "hat", "cap", "beanie"), 0.3),
+    (("watch", "jewel", "bracelet", "necklace", "ring", "earring"), 0.5),
+    (("swim", "bikini", "underwear", "bra", "brief", "legging", "sock",
+      "lingerie", "boxer"), 0.3),
+    (("sweater", "knit", "cardigan", "hoodie", "sweatshirt", "pullover",
+      "jumper", "turtleneck"), 0.8),
+    (("jean", "denim", "trouser", "pant", "chino", "jogger"), 0.8),
+    (("dress",), 0.7),
+    (("skirt", "short", "bermuda"), 0.5),
+    (("shirt", "polo", "t-shirt", "tee", "top", "blouse", "bodysuit"), 0.5),
+]
+
+def default_weight_kg(product_type: str = "", title: str = "") -> float:
+    """Return a category-default billable weight in kg (never 0)."""
+    for haystack in ((product_type or "").lower(), (title or "").lower()):
+        for keywords, kg in _WEIGHT_RULES:
+            if any(k in haystack for k in keywords):
+                return kg
+    return 0.8  # fallback
+
 # ── Pricing configuration (loaded from GitHub Secrets) ────────────────────────
 TARGET_MARGIN    = float(os.getenv("TARGET_MARGIN",    "0.25"))
 VAT_RATE         = float(os.getenv("VAT_RATE",         "0.19"))
@@ -365,6 +403,7 @@ def build_payload(group, igid, light=False):
             elif status == 'low-margin' and margin_tag != 'review-margin':
                 margin_tag = "low-margin"
 
+        wkg = default_weight_kg(sub_cat, str(first.get("title", "")))
         v = {"sku":                  str(row["sku"]),
              "price":                f"{selling_price:.2f}",
              "compare_at_price":     f"{float(row['retail_price EUR']):.2f}",
@@ -373,6 +412,8 @@ def build_payload(group, igid, light=False):
              "inventory_policy":     "deny",
              "taxable":              True,
              "requires_shipping":    True,
+             "weight":               wkg,
+             "weight_unit":          "kg",
              "_qty":                 int(row.get("quantity", 0)),
              "_cost":                cost_val,
              "_feed":                {"rrp": float(rrp) if pd.notna(rrp) and rrp else 0},
