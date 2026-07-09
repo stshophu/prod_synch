@@ -48,9 +48,15 @@ class VaittoUpsertSession:
                  params={"supplier_id": f"eq.{supplier_id}",
                          "select": "id,vaitto_sku", "limit": "10000"})
         self.existing = {}
-        if r and r.status_code == 200:
+        if r is not None and r.status_code == 200:
             self.existing = {row["vaitto_sku"]: row["id"]
                              for row in r.json() if row.get("vaitto_sku")}
+        elif r is not None:
+            log.error(f"  ⚠️  Failed to load existing products: "
+                      f"{r.status_code} {r.text[:300]}")
+        else:
+            log.error("  ⚠️  Failed to load existing products: no response "
+                      "(network error / retries exhausted)")
         log.info(f"  {supplier_name}: {len(self.existing)} existing products")
 
     def upsert(self, *, sku: str, name: str,
@@ -108,25 +114,28 @@ class VaittoUpsertSession:
 
         if is_new:
             r = _req("POST", "products", body=body, prefer="return=representation")
-            if r and r.status_code in (200, 201):
+            if r is not None and r.status_code in (200, 201):
                 data = r.json()
                 self.existing[sku] = data[0]["id"] if isinstance(data, list) else data["id"]
                 log.info(f"  ✅ CREATED  '{name}'  (stock={stock_qty})")
                 self.counts["created"] += 1
             else:
-                log.error(f"  ❌ CREATE failed {sku}: {r.status_code if r else 'no response'} {r.text[:150] if r else ''}")
+                status = r.status_code if r is not None else "no response"
+                detail = r.text[:150] if r is not None else "(network error / retries exhausted)"
+                log.error(f"  ❌ CREATE failed {sku}: {status} {detail}")
                 self.counts["errors"] += 1
         else:
             update = {k: v for k, v in body.items() if k not in ("slug", "vaitto_sku")}
             r = _req("PATCH", "products",
                      params={"id": f"eq.{self.existing[sku]}"}, body=update)
-            if r and r.status_code in (200, 204):
+            if r is not None and r.status_code in (200, 204):
                 log.info(f"  🔄 UPDATED  '{name}'  (stock={stock_qty})")
                 self.counts["updated"] += 1
             else:
-                log.error(f"  ❌ UPDATE failed {sku}: {r.status_code if r else 'no response'}")
+                status = r.status_code if r is not None else "no response"
+                detail = r.text[:150] if r is not None else "(network error / retries exhausted)"
+                log.error(f"  ❌ UPDATE failed {sku}: {status} {detail}")
                 self.counts["errors"] += 1
-        time.sleep(0.15)  # avoid overwhelming Supabase
 
     def finish(self):
         c = self.counts
