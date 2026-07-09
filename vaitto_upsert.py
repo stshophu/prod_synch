@@ -126,6 +126,7 @@ class VaittoUpsertSession:
             else:
                 log.error(f"  ❌ UPDATE failed {sku}: {r.status_code if r else 'no response'}")
                 self.counts["errors"] += 1
+        time.sleep(0.15)  # avoid overwhelming Supabase
 
     def finish(self):
         c = self.counts
