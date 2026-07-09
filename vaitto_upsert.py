@@ -1,40 +1,30 @@
 """
 vaitto_upsert.py — shared write layer for all Vaitto supplier pipelines.
+Uses direct Postgres connection (psycopg2) — bypasses Supabase REST/PostgREST.
 
 Env vars:
-  VAITTO_SUPABASE_URL
-  VAITTO_SUPABASE_SERVICE_KEY
-  VAITTO_DRY_RUN=1  (optional)
+  VAITTO_DB_URL   postgresql://postgres:xxx@db.haxjeeurccsprxkpasjk.supabase.co:5432/postgres
+  VAITTO_DRY_RUN  '1' to log without writing
 """
-import os, sys, logging, time, requests
+import os, sys, logging, time, json
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
-URL     = os.environ.get("VAITTO_SUPABASE_URL", "").rstrip("/")
-KEY     = os.environ.get("VAITTO_SUPABASE_SERVICE_KEY", "")
+DB_URL  = os.environ.get("VAITTO_DB_URL", "")
 DRY_RUN = os.environ.get("VAITTO_DRY_RUN", "0") == "1"
 
-if not URL or not KEY:
-    sys.exit("Missing VAITTO_SUPABASE_URL or VAITTO_SUPABASE_SERVICE_KEY")
+if not DB_URL:
+    sys.exit("Missing VAITTO_DB_URL")
 
-_H = {"apikey": KEY, "Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    sys.exit("Run: pip install psycopg2-binary")
 
-def _req(method, table, params=None, body=None, prefer="return=minimal"):
-    headers = {**_H, "Prefer": prefer}
-    for attempt in range(4):
-        try:
-            r = requests.request(method, f"{URL}/rest/v1/{table}",
-                                 headers=headers, params=params, json=body, timeout=30)
-            if r.status_code == 429:
-                time.sleep(float(r.headers.get("Retry-After", 5))); continue
-            if r.status_code >= 500:
-                time.sleep(2 ** attempt); continue
-            return r
-        except requests.RequestException as e:
-            log.warning(f"Network error (attempt {attempt+1}): {e}")
-            time.sleep(2 ** attempt)
-    return None
+def _conn():
+    return psycopg2.connect(DB_URL, connect_timeout=15)
 
 
 class VaittoUpsertSession:
@@ -43,24 +33,21 @@ class VaittoUpsertSession:
         self.supplier_name = supplier_name
         self.counts        = {"created": 0, "updated": 0, "deactivated": 0,
                               "skipped": 0, "errors": 0}
-        # Load existing products for this supplier (vaitto_sku → product id)
-        r = _req("GET", "products",
-                 params={"supplier_id": f"eq.{supplier_id}",
-                         "select": "id,vaitto_sku", "limit": "10000"})
+        # Load existing products (vaitto_sku → product id)
         self.existing = {}
-        if r is not None and r.status_code == 200:
-            self.existing = {row["vaitto_sku"]: row["id"]
-                             for row in r.json() if row.get("vaitto_sku")}
-        elif r is not None:
-            log.error(f"  ⚠️  Failed to load existing products: "
-                      f"{r.status_code} {r.text[:300]}")
-        else:
-            log.error("  ⚠️  Failed to load existing products: no response "
-                      "(network error / retries exhausted)")
+        try:
+            with _conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, vaitto_sku FROM products WHERE supplier_id = %s AND vaitto_sku IS NOT NULL",
+                    (supplier_id,)
+                )
+                self.existing = {row[1]: row[0] for row in cur.fetchall()}
+        except Exception as e:
+            log.error(f"Failed to load existing products: {e}")
         log.info(f"  {supplier_name}: {len(self.existing)} existing products")
 
     def upsert(self, *, sku: str, name: str,
-               brand_id: Optional[str],
+               brand_id: Optional[str] = None,
                category_id: Optional[str] = None,
                subcategory_id: Optional[str] = None,
                gender: Optional[str] = None,
@@ -81,61 +68,78 @@ class VaittoUpsertSession:
         # Deactivate existing zero-stock products
         if not is_new and stock_qty == 0:
             if not DRY_RUN:
-                _req("PATCH", "products",
-                     params={"id": f"eq.{self.existing[sku]}"},
-                     body={"active": False, "stock_qty": 0})
+                try:
+                    with _conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE products SET active = false, stock_qty = 0 WHERE id = %s",
+                            (self.existing[sku],)
+                        )
+                        conn.commit()
+                except Exception as e:
+                    log.error(f"  ❌ Deactivate failed {sku}: {e}")
+                    return
             log.info(f"  🔴 DEACTIVATED  '{name}'")
             self.counts["deactivated"] += 1
             return
 
         slug = f"{self.supplier_id[:8]}-{sku}".lower().replace(" ", "-")[:200]
-        body = {
-            "supplier_id":        self.supplier_id,
-            "vaitto_sku":         sku,
-            "name":               name,
-            "slug":               slug,
-            "brand_id":           brand_id,
-            "category_id":        category_id,
-            "subcategory_id":     subcategory_id,
-            "gender":             gender,
-            "description":        description or "",
-            "supplier_price":     round(supplier_price, 2) if supplier_price else None,
-            "rrp":                round(rrp, 2) if rrp else None,
-            "stock_qty":          stock_qty,
-            "active":             True,
-            "dropship_available": True,
-            "image_url":          image_url,
-            "images":             [{"url": u} for u in (images or [])] or [],
-        }
+        images_json = json.dumps([{"url": u} for u in (images or [])])
 
         if DRY_RUN:
             log.info(f"  [DRY RUN] {'CREATE' if is_new else 'UPDATE'} '{name}' (stock={stock_qty})")
             return
 
-        if is_new:
-            r = _req("POST", "products", body=body, prefer="return=representation")
-            if r is not None and r.status_code in (200, 201):
-                data = r.json()
-                self.existing[sku] = data[0]["id"] if isinstance(data, list) else data["id"]
-                log.info(f"  ✅ CREATED  '{name}'  (stock={stock_qty})")
-                self.counts["created"] += 1
-            else:
-                status = r.status_code if r is not None else "no response"
-                detail = r.text[:150] if r is not None else "(network error / retries exhausted)"
-                log.error(f"  ❌ CREATE failed {sku}: {status} {detail}")
-                self.counts["errors"] += 1
-        else:
-            update = {k: v for k, v in body.items() if k not in ("slug", "vaitto_sku")}
-            r = _req("PATCH", "products",
-                     params={"id": f"eq.{self.existing[sku]}"}, body=update)
-            if r is not None and r.status_code in (200, 204):
-                log.info(f"  🔄 UPDATED  '{name}'  (stock={stock_qty})")
-                self.counts["updated"] += 1
-            else:
-                status = r.status_code if r is not None else "no response"
-                detail = r.text[:150] if r is not None else "(network error / retries exhausted)"
-                log.error(f"  ❌ UPDATE failed {sku}: {status} {detail}")
-                self.counts["errors"] += 1
+        try:
+            with _conn() as conn, conn.cursor() as cur:
+                if is_new:
+                    cur.execute("""
+                        INSERT INTO products (
+                            supplier_id, vaitto_sku, name, slug, brand_id,
+                            category_id, subcategory_id, gender, description,
+                            supplier_price, rrp, stock_qty, active,
+                            dropship_available, image_url, images
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s, true,
+                            true, %s, %s
+                        ) RETURNING id
+                    """, (
+                        self.supplier_id, sku, name, slug, brand_id,
+                        category_id, subcategory_id, gender, description or "",
+                        supplier_price, rrp, stock_qty,
+                        image_url, images_json
+                    ))
+                    new_id = cur.fetchone()[0]
+                    conn.commit()
+                    self.existing[sku] = new_id
+                    log.info(f"  ✅ CREATED  '{name}'  (stock={stock_qty})")
+                    self.counts["created"] += 1
+                else:
+                    cur.execute("""
+                        UPDATE products SET
+                            name = %s, brand_id = %s,
+                            category_id = %s, subcategory_id = %s, gender = %s,
+                            description = %s, supplier_price = %s, rrp = %s,
+                            stock_qty = %s, active = true,
+                            image_url = %s, images = %s
+                        WHERE id = %s
+                    """, (
+                        name, brand_id,
+                        category_id, subcategory_id, gender,
+                        description or "", supplier_price, rrp,
+                        stock_qty,
+                        image_url, images_json,
+                        self.existing[sku]
+                    ))
+                    conn.commit()
+                    log.info(f"  🔄 UPDATED  '{name}'  (stock={stock_qty})")
+                    self.counts["updated"] += 1
+        except Exception as e:
+            log.error(f"  ❌ {'CREATE' if is_new else 'UPDATE'} failed {sku}: {e}")
+            self.counts["errors"] += 1
+
+        time.sleep(0.05)  # gentle pacing
 
     def finish(self):
         c = self.counts
