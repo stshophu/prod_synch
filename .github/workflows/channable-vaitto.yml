@@ -1,0 +1,27 @@
+name: Channable → Vaitto (Tluxy EU-WAR-2)
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # every hour on the hour
+  workflow_dispatch:        # manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install requests pandas
+
+      - name: Run sync
+        env:
+          CHANNABLE_URL:                ${{ secrets.CHANNABLE_URL }}
+          VAITTO_SUPABASE_URL:          ${{ secrets.VAITTO_SUPABASE_URL }}
+          VAITTO_SUPABASE_SERVICE_KEY:  ${{ secrets.VAITTO_SUPABASE_SERVICE_KEY }}
+          # VAITTO_DRY_RUN: '1'
+        run: python channable_sync_vaitto.py
