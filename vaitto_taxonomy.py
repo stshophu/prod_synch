@@ -140,7 +140,8 @@ _unknown_id: str = ""
 
 def load_brands(supabase_url: str, service_key: str) -> dict:
     global _brands, _unknown_id
-    import requests as req
+    import requests as req, logging
+    log = logging.getLogger(__name__)
     r = req.get(f"{supabase_url}/rest/v1/brands",
                 headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
                 params={"select": "id,name", "limit": "2000"}, timeout=15)
@@ -149,6 +150,8 @@ def load_brands(supabase_url: str, service_key: str) -> dict:
             _brands[row["name"].strip().lower()] = row["id"]
             if row["name"].strip().lower() == "unknown":
                 _unknown_id = row["id"]
+    else:
+        log.error(f"  ⚠️  Failed to load brands: {r.status_code} {r.text[:300]}")
     return _brands
 
 # ── PUBLIC RESOLVERS ───────────────────────────────────────────────────────────
