@@ -15,8 +15,7 @@ from vaitto_taxonomy import resolve_brand, resolve_category, resolve_subcategory
 SUPPLIER_ID   = "a4d69ebf-8916-440c-9640-3aec9770053e"
 SUPPLIER_NAME = "Tluxy (EU-WAR-2)"
 CHANNABLE_URL = os.environ.get("CHANNABLE_URL", "")
-SB_URL        = os.environ.get("VAITTO_SUPABASE_URL", "")
-SB_KEY        = os.environ.get("VAITTO_SUPABASE_SERVICE_KEY", "")
+DB_URL        = os.environ.get("VAITTO_DB_URL", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ def run():
     log.info(f"🚀  Channable → Vaitto  {datetime.now():%Y-%m-%d %H:%M:%S}")
 
     # Load brands once
-    brands = load_brands(SB_URL, SB_KEY)
+    brands = load_brands(DB_URL)
     log.info(f"  {len(brands)} brands loaded")
 
     r = requests.get(CHANNABLE_URL, timeout=60)
@@ -64,7 +63,7 @@ def run():
         session.upsert(
             sku=str(igid),
             name=str(first.get("title", igid)),
-            brand_id=resolve_brand(vendor, SB_URL, SB_KEY),
+            brand_id=resolve_brand(vendor),
             category_id=resolve_category(subcat),
             subcategory_id=resolve_subcategory(subcat),
             gender=resolve_gender(gender),
