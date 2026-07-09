@@ -138,20 +138,25 @@ _GENDER = {
 _brands: dict = {}  # name.lower() → uuid
 _unknown_id: str = ""
 
-def load_brands(supabase_url: str, service_key: str) -> dict:
+def load_brands(db_url: str = None, *args) -> dict:
+    """Load all brands from DB into cache via direct Postgres connection."""
     global _brands, _unknown_id
-    import requests as req, logging
-    log = logging.getLogger(__name__)
-    r = req.get(f"{supabase_url}/rest/v1/brands",
-                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
-                params={"select": "id,name", "limit": "2000"}, timeout=15)
-    if r.status_code == 200:
-        for row in r.json():
-            _brands[row["name"].strip().lower()] = row["id"]
-            if row["name"].strip().lower() == "unknown":
-                _unknown_id = row["id"]
-    else:
-        log.error(f"  ⚠️  Failed to load brands: {r.status_code} {r.text[:300]}")
+    import psycopg2
+    url = db_url or os.environ.get("VAITTO_DB_URL", "")
+    if not url:
+        return {}
+    try:
+        with psycopg2.connect(url, connect_timeout=15) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name FROM brands WHERE active = true")
+                for row in cur.fetchall():
+                    bid, bname = row
+                    _brands[bname.strip().lower()] = str(bid)
+                    if bname.strip().lower() == "unknown":
+                        _unknown_id = str(bid)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Brand load failed: {e}")
     return _brands
 
 # ── PUBLIC RESOLVERS ───────────────────────────────────────────────────────────
