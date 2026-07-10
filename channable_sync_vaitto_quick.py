@@ -28,6 +28,34 @@ SB_KEY        = os.environ.get("VAITTO_SUPABASE_SERVICE_KEY", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
+def get_existing_skus(supabase_url: str, service_key: str, supplier_id: str) -> set:
+    """Fetch the set of vaitto_sku values already in Vaitto for this supplier.
+    Used to skip brand-new products in the quick sync — new products should
+    only be created by the full sync, which sends images/category/etc."""
+    if not supabase_url or not service_key:
+        log.warning("  Missing Supabase creds — cannot check existing SKUs, "
+                    "skipping quick sync run to avoid creating incomplete products")
+        sys.exit(1)
+    skus, offset, page = set(), 0, 1000
+    while True:
+        r = requests.get(
+            f"{supabase_url.rstrip('/')}/rest/v1/products",
+            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+            params={"supplier_id": f"eq.{supplier_id}", "select": "vaitto_sku",
+                    "limit": str(page), "offset": str(offset)},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.error(f"  Failed to fetch existing SKUs: {r.status_code} {r.text[:300]}")
+            sys.exit(1)
+        rows = r.json()
+        skus.update(row["vaitto_sku"] for row in rows if row.get("vaitto_sku"))
+        if len(rows) < page:
+            break
+        offset += page
+    return skus
+
+
 def run():
     if not CHANNABLE_URL:
         sys.exit("Missing CHANNABLE_URL")
@@ -38,6 +66,10 @@ def run():
     # but this is a fast cached lookup, not the bottleneck.
     brands = load_brands(SB_URL, SB_KEY)
     log.info(f"  {len(brands)} brands loaded")
+
+    existing_skus = get_existing_skus(SB_URL, SB_KEY, SUPPLIER_ID)
+    log.info(f"  {len(existing_skus)} existing SKUs found — new products will be skipped "
+             f"(handled by full sync instead)")
 
     r = requests.get(CHANNABLE_URL, timeout=60)
     r.raise_for_status()
@@ -50,7 +82,12 @@ def run():
 
     session = VaittoUpsertSession(SUPPLIER_ID, SUPPLIER_NAME)
 
+    skipped_new = 0
     for i, (igid, group) in enumerate(df.groupby("item_group_id"), 1):
+        if str(igid) not in existing_skus:
+            skipped_new += 1
+            continue
+
         first     = group.iloc[0]
         stock_qty = int(group["quantity"].sum())
         ref       = group[group["quantity"] > 0].iloc[0] if stock_qty > 0 else first
@@ -69,6 +106,7 @@ def run():
             images=[],
         )
 
+    log.info(f"  {skipped_new} new products skipped (will be created by the full sync)")
     session.finish()
 
 if __name__ == "__main__":
