@@ -49,7 +49,14 @@ def _post_batch(products: list) -> dict:
             if r.status_code == 400:
                 log.error(f"  Bad request: {r.text[:200]}")
                 return {"created": 0, "updated": 0, "deactivated": 0, "skipped": 0, "errors": []}
-            return r.json()
+            if not r.text or not r.text.strip():
+                log.warning(f"  Empty response from webhook (status {r.status_code})")
+                return {"created": 0, "updated": 0, "deactivated": 0, "skipped": 0, "errors": []}
+            try:
+                return r.json()
+            except Exception:
+                log.warning(f"  Non-JSON response ({r.status_code}): {r.text[:200]}")
+                return {"created": 0, "updated": 0, "deactivated": 0, "skipped": 0, "errors": []}
         except requests.RequestException as e:
             log.warning(f"  Network error (attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)
