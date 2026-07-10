@@ -15,7 +15,7 @@ from vaitto_taxonomy import resolve_brand, resolve_category, resolve_subcategory
 SUPPLIER_ID   = "a4d69ebf-8916-440c-9640-3aec9770053e"
 SUPPLIER_NAME = "Tluxy (EU-WAR-2)"
 CHANNABLE_URL = os.environ.get("CHANNABLE_URL", "")
-DB_URL        = os.environ.get("VAITTO_DB_URL", "")
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -27,9 +27,6 @@ def run():
     log.info(f"🚀  Channable → Vaitto  {datetime.now():%Y-%m-%d %H:%M:%S}")
 
     # Load brands once
-    brands = load_brands(DB_URL)
-    log.info(f"  {len(brands)} brands loaded")
-
     r = requests.get(CHANNABLE_URL, timeout=60)
     r.raise_for_status()
     df = pd.read_csv(StringIO(r.text))
