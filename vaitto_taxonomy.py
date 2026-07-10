@@ -138,25 +138,8 @@ _GENDER = {
 _brands: dict = {}  # name.lower() → uuid
 _unknown_id: str = ""
 
-def load_brands(db_url: str = None, *args) -> dict:
-    """Load all brands from DB into cache via direct Postgres connection."""
-    global _brands, _unknown_id
-    import psycopg2
-    url = db_url or os.environ.get("VAITTO_DB_URL", "")
-    if not url:
-        return {}
-    try:
-        with psycopg2.connect(url, connect_timeout=15) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, name FROM brands WHERE active = true")
-                for row in cur.fetchall():
-                    bid, bname = row
-                    _brands[bname.strip().lower()] = str(bid)
-                    if bname.strip().lower() == "unknown":
-                        _unknown_id = str(bid)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Brand load failed: {e}")
+def load_brands(*args, **kwargs) -> dict:
+    """No-op: brand resolution now handled server-side by the Vaitto webhook."""
     return _brands
 
 # ── PUBLIC RESOLVERS ───────────────────────────────────────────────────────────
