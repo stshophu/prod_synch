@@ -14,10 +14,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests pandas psycopg2-binary
+      - run: pip install requests pandas
       - name: Run sync
         env:
-          CHANNABLE_URL:    ${{ secrets.CHANNABLE_URL }}
-          VAITTO_DB_URL:    ${{ secrets.VAITTO_DB_URL }}
+          CHANNABLE_URL:      ${{ secrets.CHANNABLE_URL }}
+          IMPORT_HOOK_SECRET: ${{ secrets.IMPORT_HOOK_SECRET }}
+          VAITTO_HOOK_URL:    https://vaitto.com/api/public/hooks/vaitto-product-import
           # VAITTO_DRY_RUN: '1'
         run: python channable_sync_vaitto.py
