@@ -83,21 +83,23 @@ class VaittoUpsertSession:
                image_url: Optional[str] = None,
                images: list = None):
 
-        self.batch.append({
+        product = {
             "vaitto_sku":     sku,
             "name":           name,
             "supplier_id":    self.supplier_id,
-            "brand_id":       brand_id,
-            "category_id":    category_id,
-            "subcategory_id": subcategory_id,
-            "gender":         gender,
-            "supplier_price": supplier_price,
-            "rrp":            rrp,
             "stock_qty":      stock_qty,
-            "description":    description,
-            "image_url":      image_url,
             "images":         images or [],
-        })
+        }
+        # Only include optional fields if they have a value (avoid sending null)
+        if brand_id:       product["brand_id"]       = brand_id
+        if category_id:    product["category_id"]    = category_id
+        if subcategory_id: product["subcategory_id"] = subcategory_id
+        if gender:         product["gender"]          = gender
+        if supplier_price: product["supplier_price"] = supplier_price
+        if rrp:            product["rrp"]             = rrp
+        if description:    product["description"]    = description
+        if image_url:      product["image_url"]      = image_url
+        self.batch.append(product)
 
         if len(self.batch) >= BATCH_SIZE:
             self._flush()
