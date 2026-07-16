@@ -32,6 +32,12 @@ def run():
     brands = load_brands(SB_URL, SB_KEY)
     log.info(f"  {len(brands)} brands loaded")
 
+    # TEMP DEBUG — confirm which vaitto_taxonomy.py is actually loaded at runtime
+    import vaitto_taxonomy
+    log.info(f"  DEBUG: vaitto_taxonomy loaded from: {vaitto_taxonomy.__file__}")
+    log.info(f"  DEBUG: resolve_category('Jacket') -> {resolve_category('Jacket')!r}")
+    log.info(f"  DEBUG: resolve_category('Bag') -> {resolve_category('Bag')!r}")
+
     r = requests.get(CHANNABLE_URL, timeout=60)
     r.raise_for_status()
     df = pd.read_csv(StringIO(r.text))
@@ -43,6 +49,7 @@ def run():
 
     session = VaittoUpsertSession(SUPPLIER_ID, SUPPLIER_NAME)
 
+    debug_logged = 0
     for i, (igid, group) in enumerate(df.groupby("item_group_id"), 1):
         first     = group.iloc[0]
         stock_qty = int(group["quantity"].sum())
@@ -61,13 +68,22 @@ def run():
                 if u and u.lower() != "nan" and u not in seen:
                     seen.add(u); images.append(u)
 
+        cat_id = resolve_category(subcat)
+        subcat_id = resolve_subcategory(subcat)
+
+        # TEMP DEBUG — log the resolver's actual output for the first 10 products
+        if debug_logged < 10:
+            log.info(f"  DEBUG  igid={igid!r}  subcat={subcat!r}  "
+                     f"-> category_id={cat_id!r}  subcategory_id={subcat_id!r}")
+            debug_logged += 1
+
         log.info(f"[{i}]  {igid}  '{first.get('title','')}' stock={stock_qty}")
         session.upsert(
             sku=str(igid),
             name=str(first.get("title", igid)),
             brand_id=resolve_brand(vendor),
-            category_id=resolve_category(subcat),
-            subcategory_id=resolve_subcategory(subcat),
+            category_id=cat_id,
+            subcategory_id=subcat_id,
             gender=resolve_gender(gender),
             supplier_price=float(cost) if pd.notna(cost) and cost else None,
             rrp=float(rrp) if pd.notna(rrp) and rrp else None,
