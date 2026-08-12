@@ -73,7 +73,7 @@ def run():
                 if u and u.lower() != "nan" and u not in seen:
                     seen.add(u); images.append(u)
 
-        cat_id    = resolve_category(cat) or resolve_category(subcat)
+        cat_id    = resolve_category(cat, subcat)
         subcat_id = resolve_subcategory(subcat)
 
         if not cat_id:    unmapped_cat.add(cat or subcat)
