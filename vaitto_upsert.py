@@ -72,6 +72,7 @@ class VaittoUpsertSession:
         log.info(f"  {supplier_name}: webhook mode → {HOOK_URL}")
 
     def upsert(self, *, sku: str, name: str,
+               brand: Optional[str] = None,
                brand_id: Optional[str] = None,
                category_id: Optional[str] = None,
                subcategory_id: Optional[str] = None,
@@ -88,10 +89,10 @@ class VaittoUpsertSession:
             "name":           name,
             "supplier_id":    self.supplier_id,
             "stock_qty":      stock_qty,
-            "images":         images or [],
         }
         # Only include optional fields if they have a value (avoid sending null)
         if brand_id:       product["brand_id"]       = brand_id
+        elif brand:        product["brand"]          = brand
         if category_id:    product["category_id"]    = category_id
         if subcategory_id: product["subcategory_id"] = subcategory_id
         if gender:         product["gender"]          = gender
@@ -99,6 +100,9 @@ class VaittoUpsertSession:
         if rrp:            product["rrp"]             = rrp
         if description:    product["description"]    = description
         if image_url:      product["image_url"]      = image_url
+        # Never send an empty images array: the quick sync would otherwise
+        # wipe the photos written by the full sync.
+        if images:         product["images"]         = images
         self.batch.append(product)
 
         if len(self.batch) >= BATCH_SIZE:

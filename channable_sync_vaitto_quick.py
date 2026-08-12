@@ -17,7 +17,7 @@ import requests, pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from vaitto_upsert import VaittoUpsertSession
-from vaitto_taxonomy import resolve_brand, load_brands
+from vaitto_taxonomy import load_brands
 
 SUPPLIER_ID   = "a4d69ebf-8916-440c-9640-3aec9770053e"
 SUPPLIER_NAME = "Tluxy (EU-WAR-2) [quick]"
@@ -96,14 +96,15 @@ def run():
         vendor    = str(first.get("vendor", "")).strip()
 
         # Minimal payload: no images, no category/subcategory/gender/description.
+        # vaitto_upsert only sends keys that have a value, so omitted fields are
+        # left untouched by the webhook rather than overwritten with blanks.
         session.upsert(
             sku=str(igid),
             name=str(first.get("title", igid)),
-            brand_id=resolve_brand(vendor),
+            brand=vendor or None,
             supplier_price=float(cost) if pd.notna(cost) and cost else None,
             rrp=float(rrp) if pd.notna(rrp) and rrp else None,
             stock_qty=stock_qty,
-            images=[],
         )
 
     log.info(f"  {skipped_new} new products skipped (will be created by the full sync)")

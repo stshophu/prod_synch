@@ -1,7 +1,11 @@
 """
 vaitto_taxonomy.py — maps feed values to Vaitto UUID references.
-Call load_brands() once at session start, then use resolve_*() functions.
+Call load_brands(SB_URL, SB_KEY) once at session start, then use resolve_*().
 """
+import re
+import logging
+
+log = logging.getLogger(__name__)
 
 # ── CATEGORIES ─────────────────────────────────────────────────────────────────
 CATEGORY_IDS = {
@@ -16,17 +20,20 @@ _CAT = {
     "jackets":"Clothing","jacket":"Clothing","coats":"Clothing","coat":"Clothing",
     "dresses":"Clothing","dress":"Clothing","pants":"Clothing","trousers":"Clothing",
     "jeans":"Clothing","shorts":"Clothing","skirts":"Clothing","skirt":"Clothing",
-    "knitwear":"Clothing","sweaters":"Clothing","shirts":"Clothing","shirt":"Clothing",
-    "polos":"Clothing","polo":"Clothing","t-shirts":"Clothing","tops":"Clothing",
-    "hoodies":"Clothing","vests":"Clothing","jumpsuits":"Clothing",
-    "swimwear":"Clothing","underwear":"Clothing","intimo":"Clothing",
+    "knitwear":"Clothing","sweaters":"Clothing","sweater":"Clothing",
+    "sweatshirt":"Clothing","sweatshirts":"Clothing","cardigan":"Clothing",
+    "shirts":"Clothing","shirt":"Clothing","blouse":"Clothing","blazer":"Clothing",
+    "polos":"Clothing","polo":"Clothing","t-shirts":"Clothing","t-shirt":"Clothing",
+    "tops":"Clothing","top":"Clothing","windbreaker":"Clothing","winkbreaker":"Clothing",
+    "hoodies":"Clothing","vests":"Clothing","jumpsuits":"Clothing","jumpsuit":"Clothing",
+    "swimwear":"Clothing","swimsuit":"Clothing","underwear":"Clothing","intimo":"Clothing",
     "shoes":"Shoes","calzature":"Shoes","scarpe":"Shoes",
-    "sneakers":"Shoes","boots":"Shoes","sandals":"Shoes",
-    "loafers":"Shoes","heels":"Shoes","flats":"Shoes",
+    "sneakers":"Shoes","boots":"Shoes","sandals":"Shoes","mules":"Shoes",
+    "loafers":"Shoes","heels":"Shoes","flats":"Shoes","pumps":"Shoes",
     "bags":"Bags","borse":"Bags","handbags":"Bags","tote":"Bags",
     "clutch":"Bags","backpack":"Bags","crossbody":"Bags",
     "accessories":"Accessories","accessori":"Accessories",
-    "wallets":"Accessories","belts":"Accessories","scarves":"Accessories",
+    "wallets":"Accessories","belts":"Accessories","scarves":"Accessories","scarf":"Accessories",
     "hats":"Accessories","gloves":"Accessories","sunglasses":"Accessories",
     "ties":"Accessories","watches":"Accessories","hosiery":"Accessories",
     "jewelry":"Jewelry","gioielleria":"Jewelry","gioielli":"Jewelry",
@@ -81,6 +88,7 @@ _SUB = {
     "jackets":"Jackets","jacket":"Jackets","giacche":"Jackets","giubbini":"Jackets",
     "coats":"Jackets","coat":"Jackets","cappotti":"Jackets","trench":"Jackets",
     "down jackets":"Jackets","piumini":"Jackets","bomber":"Jackets","blazer":"Jackets",
+    "windbreaker":"Jackets","winkbreaker":"Jackets","parka":"Jackets",
     "dresses":"Dresses","dress":"Dresses","abiti":"Dresses",
     "pants":"Pants","trousers":"Pants","pantaloni":"Pants","sweatpants":"Pants",
     "jeans":"Jeans",
@@ -89,22 +97,24 @@ _SUB = {
     "knitwear":"Knitwear","maglie":"Knitwear","maglieria":"Knitwear",
     "sweaters":"Knitwear","sweater":"Knitwear","maglioni":"Knitwear",
     "cardigans":"Knitwear","cardigan":"Knitwear","turtlenecks":"Knitwear",
-    "sweatshirts":"Knitwear","felpe":"Knitwear","pullover":"Knitwear",
-    "shirts":"Shirts","shirt":"Shirts","camicie":"Shirts",
+    "sweatshirts":"Knitwear","sweatshirt":"Knitwear","felpe":"Knitwear","pullover":"Knitwear",
+    "shirts":"Shirts","shirt":"Shirts","camicie":"Shirts","blouse":"Shirts","blouses":"Shirts",
     "polo":"Polos","polo shirts":"Polos","polos":"Polos",
     "t-shirts":"T-shirts & Tops","t-shirt":"T-shirts & Tops",
     "tops":"T-shirts & Tops","top":"T-shirts & Tops",
     "t-shirts & tops":"T-shirts & Tops","tank tops":"T-shirts & Tops",
     "hoodies":"Hoodies","hoodie":"Hoodies",
     "vests":"Vests","vest":"Vests","gilet":"Vests","smanicati":"Vests",
-    "jumpsuits":"Jumpsuits","tute":"Jumpsuits","suits":"Jumpsuits",
-    "swimwear":"Swimwear","costumi":"Swimwear","bikinis":"Swimwear","bikini":"Swimwear",
+    "jumpsuits":"Jumpsuits","jumpsuit":"Jumpsuits","tute":"Jumpsuits","suits":"Jumpsuits",
+    "swimwear":"Swimwear","swimsuit":"Swimwear","swim shorts":"Swimwear",
+    "costumi":"Swimwear","bikinis":"Swimwear","bikini":"Swimwear",
     "underwear":"Underwear","intimo":"Underwear",
     "sneakers":"Sneakers","sneaker":"Sneakers",
     "boots":"Boots","stivali":"Boots","ankle boots":"Boots","stivaletti":"Boots",
     "sandals":"Sandals","sandali":"Sandals",
     "loafers":"Loafers","mocassini":"Loafers","espadrilles":"Loafers",
-    "heels":"Heels","decollete":"Heels","pumps":"Heels",
+    "mules":"Loafers","slippers":"Loafers",
+    "heels":"Heels","decollete":"Heels","pumps":"Heels","slingback":"Heels",
     "flats":"Flats","ballerine":"Flats","ballet flats":"Flats",
     "handbags":"Handbags","borse a mano":"Handbags",
     "shoulder bags":"Shoulder","borse a spalla":"Shoulder",
@@ -114,16 +124,18 @@ _SUB = {
     "backpack":"Backpack","backpacks":"Backpack","zaini":"Backpack","belt bags":"Backpack",
     "wallets":"Wallet","wallet":"Wallet","portafogli":"Wallet","card holders":"Wallet",
     "belts":"Belts","belt":"Belts","cinture":"Belts",
-    "scarves":"Scarves","scarf":"Scarves","sciarpe":"Scarves",
-    "hats":"Hats","hat":"Hats","cappelli":"Hats","caps":"Hats",
+    "scarves":"Scarves","scarf":"Scarves","sciarpe":"Scarves","foulard":"Scarves",
+    "hats":"Hats","hat":"Hats","cappelli":"Hats","caps":"Hats","cap":"Hats",
     "gloves":"Gloves","guanti":"Gloves",
     "sunglasses":"Sunglasses","occhiali da sole":"Sunglasses",
     "ties":"Ties","tie":"Ties","cravatte":"Ties","bow ties":"Ties",
     "pocket squares":"Pocket Squares","fazzoletti":"Pocket Squares",
     "hosiery":"Hosiery","socks":"Hosiery","calze":"Hosiery",
-    "bracelets":"Bracelets","bracciali":"Bracelets",
+    "bracelets":"Bracelets","bracelet":"Bracelets","bracciali":"Bracelets",
     "earrings":"Earrings","orecchini":"Earrings",
-    "rings":"Rings","necklaces":"Necklaces","watches":"Watches",
+    "rings":"Rings","ring":"Rings",
+    "necklaces":"Necklaces","necklace":"Necklaces",
+    "watches":"Watches","watch":"Watches",
 }
 
 # ── GENDER ─────────────────────────────────────────────────────────────────────
@@ -131,45 +143,106 @@ _GENDER = {
     "men":"Men","man":"Men","uomo":"Men","uoomo":"Men","m":"Men",
     "women":"Women","woman":"Women","donna":"Women","f":"Women",
     "unisex":"Unisex","u":"Unisex",
-    "kids":"Kids","junior":"Kids","bambino":"Kids","bambina":"Kids",
+    # The import webhook's enum is Women | Men | Unisex only. Anything else
+    # fails Zod validation and rejects the ENTIRE batch of 50, so kids' sizing
+    # is sent as Unisex rather than as a value the schema will refuse.
+    "kids":"Unisex","junior":"Unisex","bambino":"Unisex","bambina":"Unisex",
 }
 
 # ── BRAND CACHE ────────────────────────────────────────────────────────────────
-_brands: dict = {}  # name.lower() → uuid
+_brands: dict = {}   # normalized name -> uuid
 _unknown_id: str = ""
 
-def load_brands(*args, **kwargs) -> dict:
-    """No-op: brand resolution now handled server-side by the Vaitto webhook."""
+
+def _norm(s: str) -> str:
+    """lowercase, & -> and, strip punctuation, collapse spaces."""
+    s = (s or "").strip().lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _variants(key: str):
+    yield key
+    if key.endswith("s"):
+        yield key[:-1]
+    else:
+        yield key + "s"
+
+
+def load_brands(supabase_url: str = "", service_key: str = "") -> dict:
+    """Load brand name -> uuid from Vaitto's brands table. Idempotent."""
+    global _brands, _unknown_id
+    if _brands:
+        return _brands
+    if not supabase_url or not service_key:
+        log.warning("  load_brands: missing Supabase credentials - brand_id will be omitted")
+        return _brands
+
+    import requests
+    offset, page = 0, 1000
+    while True:
+        r = requests.get(
+            f"{supabase_url.rstrip('/')}/rest/v1/brands",
+            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+            params={"select": "id,name", "limit": str(page), "offset": str(offset)},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.error(f"  load_brands failed: {r.status_code} {r.text[:300]}")
+            return _brands
+        rows = r.json()
+        for row in rows:
+            name, bid = row.get("name"), row.get("id")
+            if name and bid:
+                key = _norm(name)
+                _brands[key] = bid
+                if key == "unknown":
+                    _unknown_id = bid
+        if len(rows) < page:
+            break
+        offset += page
+    log.info(f"  load_brands: {len(_brands)} brands cached")
     return _brands
+
+
+def unmapped_brand(name: str) -> bool:
+    """True if this vendor string has no matching brand row (for logging)."""
+    return bool(name) and _norm(name) not in _brands
+
 
 # ── PUBLIC RESOLVERS ───────────────────────────────────────────────────────────
 
 def resolve_brand(name: str, *args) -> str | None:
-    """Returns brand UUID or None if not found."""
     if not name:
         return _unknown_id or None
-    return _brands.get(name.strip().lower()) or _unknown_id or None
+    return _brands.get(_norm(name)) or _unknown_id or None
+
+
+def _lookup(raw: str, table: dict) -> str | None:
+    if not raw:
+        return None
+    key = _norm(raw)
+    for v in _variants(key):
+        if v in table:
+            return table[v]
+    for k in sorted(table, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(_norm(k))}\b", key):
+            return table[k]
+    return None
+
 
 def resolve_category(raw: str) -> str | None:
-    if not raw: return None
-    key = raw.strip().lower()
-    name = _CAT.get(key)
-    if not name:
-        for k, v in _CAT.items():
-            if k in key:
-                name = v; break
+    name = _lookup(raw, _CAT)
     return CATEGORY_IDS.get(name) if name else None
 
+
 def resolve_subcategory(raw: str) -> str | None:
-    if not raw: return None
-    key = raw.strip().lower()
-    name = _SUB.get(key)
-    if not name:
-        for k, v in _SUB.items():
-            if k in key:
-                name = v; break
+    name = _lookup(raw, _SUB)
     return SUBCATEGORY_IDS.get(name) if name else None
 
+
 def resolve_gender(raw: str) -> str | None:
-    if not raw: return None
-    return _GENDER.get(raw.strip().lower())
+    if not raw:
+        return None
+    return _GENDER.get(_norm(raw))
