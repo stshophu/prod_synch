@@ -26,6 +26,95 @@ def _clean(v) -> str:
     return "" if s.lower() in ("nan", "none") else s
 
 
+
+MIN_FEED_RATIO = 0.5   # abort the sweep if the feed shrank by more than half
+
+
+def deactivate_missing(seen_skus: set, dry_run: bool) -> None:
+    """Deactivate this supplier's active products that are no longer in the feed.
+
+    Tluxy drops products from the feed entirely rather than sending them at
+    stock 0, so the webhook's own deactivation path never sees them and they
+    stay buyable forever. Products carrying manually booked return stock are
+    left alone: that stock is physically in Hanau and has nothing to do with
+    what the supplier still lists.
+    """
+    if not SB_URL or not SB_KEY:
+        log.warning("  Sweep skipped: no Supabase credentials")
+        return
+
+    headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
+    active, offset, page = [], 0, 1000
+    while True:
+        r = requests.get(
+            f"{SB_URL.rstrip('/')}/rest/v1/products",
+            headers=headers,
+            params={"select": "id,vaitto_sku,name,returned_qty",
+                    "supplier_id": f"eq.{SUPPLIER_ID}", "active": "eq.true",
+                    "limit": str(page), "offset": str(offset)},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            log.error(f"  Sweep aborted — could not list products: "
+                      f"{r.status_code} {r.text[:300]}")
+            return
+        rows = r.json()
+        active.extend(rows)
+        if len(rows) < page:
+            break
+        offset += page
+
+    if not active:
+        return
+
+    # A truncated download is the one way this does real damage. If the feed
+    # carries less than half of what is currently active, something is wrong
+    # with the feed rather than with the catalogue — leave it alone.
+    ratio = len(seen_skus) / len(active)
+    if ratio < MIN_FEED_RATIO:
+        log.error(f"  ⛔  Sweep aborted — feed has {len(seen_skus)} products vs "
+                  f"{len(active)} active ({ratio:.0%}). Suspected truncated feed.")
+        return
+
+    stale = [p for p in active if p["vaitto_sku"] not in seen_skus]
+    kept  = [p for p in stale if (p.get("returned_qty") or 0) > 0]
+    drop  = [p for p in stale if (p.get("returned_qty") or 0) == 0]
+
+    for p in kept:
+        log.info(f"  ↩️  keeping {p['vaitto_sku']}  '{p['name']}'  "
+                 f"(returned_qty={p['returned_qty']})")
+    for p in drop:
+        log.info(f"  🔻 {'[DRY RUN] would deactivate' if dry_run else 'deactivating'}"
+                 f"  {p['vaitto_sku']}  '{p['name']}'")
+
+    if not drop:
+        log.info("  Sweep: nothing to deactivate")
+        return
+    if dry_run:
+        log.info(f"  [DRY RUN] would deactivate {len(drop)} products")
+        return
+
+    failed = 0
+    for i in range(0, len(drop), 50):
+        chunk = drop[i:i + 50]
+        ids = ",".join(p["id"] for p in chunk)
+        r = requests.patch(
+            f"{SB_URL.rstrip('/')}/rest/v1/products",
+            headers={**headers, "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            params={"id": f"in.({ids})"},
+            json={"active": False},
+            timeout=60,
+        )
+        if r.status_code not in (200, 204):
+            failed += len(chunk)
+            log.error(f"  Sweep chunk failed: {r.status_code} {r.text[:300]}")
+
+    log.info(f"  Sweep: {len(drop) - failed} deactivated, {len(kept)} kept "
+             f"(return stock), {failed} failed")
+
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
@@ -51,6 +140,7 @@ def run():
     session = VaittoUpsertSession(SUPPLIER_ID, SUPPLIER_NAME)
 
     unmapped_cat, unmapped_sub = set(), set()
+    seen_skus = set()
     missing_desc = missing_img = missing_barcode = 0
     for i, (igid, group) in enumerate(df.groupby("item_group_id"), 1):
         first     = group.iloc[0]
@@ -95,6 +185,8 @@ def run():
             images=images[:10],
         )
 
+        seen_skus.add(igid)
+
         if not desc:    missing_desc += 1
         if not images:  missing_img += 1
         if not barcode: missing_barcode += 1
@@ -107,6 +199,9 @@ def run():
         log.warning(f"  Unmapped categories: {sorted(v for v in unmapped_cat if v)}")
     if unmapped_sub:
         log.warning(f"  Unmapped sub_categories: {sorted(v for v in unmapped_sub if v)}")
+
+    log.info(f"\n  Sweeping products no longer in the feed…")
+    deactivate_missing(seen_skus, dry_run=bool(os.environ.get("VAITTO_DRY_RUN")))
 
 if __name__ == "__main__":
     run()
