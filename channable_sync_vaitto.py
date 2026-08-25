@@ -141,6 +141,7 @@ def run():
 
     unmapped_cat, unmapped_sub = set(), set()
     seen_skus = set()
+    total_variants = 0
     missing_desc = missing_img = missing_barcode = 0
     for i, (igid, group) in enumerate(df.groupby("item_group_id"), 1):
         first     = group.iloc[0]
@@ -154,7 +155,29 @@ def run():
         subcat   = _clean(first.get("sub_category"))
         gender   = _clean(first.get("gender"))
         desc     = _clean(first.get("description"))
-        barcode  = _clean(ref.get("gtin"))   # not yet accepted by the webhook
+        barcode  = _clean(ref.get("gtin"))
+
+        # One variant per feed row: the feed is variant-level, each row being a
+        # single size with its own SKU, barcode and quantity. Previously this
+        # loop didn't exist at all, so no size data was ever collected or sent
+        # to the webhook -- every product landed with zero variant rows.
+        variants, seen_v = [], set()
+        for _, r in group.iterrows():
+            v_sku = _clean(r.get("sku"))
+            if not v_sku or v_sku in seen_v:
+                continue
+            seen_v.add(v_sku)
+            try:
+                v_qty = int(float(r.get("quantity") or 0))
+            except (TypeError, ValueError):
+                v_qty = 0
+            variants.append({
+                "sku":       v_sku,
+                "size":      _clean(r.get("size")) or None,
+                "colour":    _clean(r.get("color")) or None,
+                "barcode":   _clean(r.get("gtin")) or None,
+                "stock_qty": max(0, v_qty),
+            })
 
         images, seen = [], set()
         for _, row in group.iterrows():
@@ -183,6 +206,7 @@ def run():
             description=desc or None,
             image_url=images[0] if images else None,
             images=images[:10],
+            variants=variants or None,
         )
 
         seen_skus.add(igid)
@@ -190,11 +214,13 @@ def run():
         if not desc:    missing_desc += 1
         if not images:  missing_img += 1
         if not barcode: missing_barcode += 1
+        total_variants += len(variants)
 
     session.finish()
 
     log.info(f"\n  Feed coverage — no description: {missing_desc}  "
-             f"no image: {missing_img}  no barcode: {missing_barcode}")
+             f"no image: {missing_img}  no barcode: {missing_barcode}  "
+             f"variants sent: {total_variants}")
     if unmapped_cat:
         log.warning(f"  Unmapped categories: {sorted(v for v in unmapped_cat if v)}")
     if unmapped_sub:
