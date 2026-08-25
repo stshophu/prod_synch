@@ -132,6 +132,10 @@ def run():
     r.raise_for_status()
     df = pd.read_csv(StringIO(r.text))
     df.columns = df.columns.str.strip()
+    log.info(f"  DEBUG columns: {list(df.columns)}")
+    if len(df) > 0:
+        log.info(f"  DEBUG sample row — sku={df.iloc[0].get('sku')!r}  "
+                 f"size={df.iloc[0].get('size')!r}  color={df.iloc[0].get('color')!r}")
     df["quantity"]         = pd.to_numeric(df.get("quantity"),         errors="coerce").fillna(0).astype(int)
     df["wholesale_ EUR"]   = pd.to_numeric(df.get("wholesale_ EUR"),   errors="coerce")
     df["retail_price EUR"] = pd.to_numeric(df.get("retail_price EUR"), errors="coerce")
