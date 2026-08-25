@@ -82,7 +82,8 @@ class VaittoUpsertSession:
                stock_qty: int,
                description: Optional[str] = None,
                image_url: Optional[str] = None,
-               images: list = None):
+               images: list = None,
+               variants: list = None):
 
         product = {
             "vaitto_sku":     sku,
@@ -103,6 +104,9 @@ class VaittoUpsertSession:
         # Never send an empty images array: the quick sync would otherwise
         # wipe the photos written by the full sync.
         if images:         product["images"]         = images
+        # Only sent when the feed is variant-level. Omitting the key entirely
+        # leaves existing variants untouched rather than zeroing them.
+        if variants:       product["variants"]       = variants
         self.batch.append(product)
 
         if len(self.batch) >= BATCH_SIZE:
