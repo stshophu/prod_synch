@@ -137,7 +137,7 @@ log = logging.getLogger(__name__)
 S = requests.Session()
 S.headers.update({"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json"})
 
-def shopify(method, path, body=None, retries=4):
+def shopify(method, path, body=None, retries=8):
     url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VER}/{path}"
     for attempt in range(retries):
         try:
@@ -274,9 +274,27 @@ def get_category_id(sub_category):
 # "recreate" duplicate bug: any transient 5xx/timeout on it made the script
 # treat an existing product as if it didn't exist and create a new one.
 
+_SCAN_FIELDS = "id,tags,created_at,status,variants"
+
+def _variant_state(v):
+    """Snapshot of a variant as it currently is in Shopify (from the scan)."""
+    return {
+        "id":                v["id"],
+        "inventory_item_id": v.get("inventory_item_id"),
+        "qty":               v.get("inventory_quantity"),
+        "price":             v.get("price"),
+        "compare_at_price":  v.get("compare_at_price"),
+        "barcode":           v.get("barcode") or "",
+    }
+
 def build_existing_map():
+    """
+    Returns (product_map, by_igid):
+      product_map[igid] = {"id", "status", "variants": {sku: variant_state}}  (canonical/oldest copy)
+      by_igid[igid]     = [raw product, ...]  (ALL tagged copies — used for sold-out zeroing)
+    """
     log.info("  Scanning Shopify for previously-synced products…")
-    by_igid, path = {}, "products.json?limit=250&fields=id,tags,created_at,variants"
+    by_igid, path = {}, f"products.json?limit=250&fields={_SCAN_FIELDS}"
     pages = 0
     while path:
         full = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VER}/{path}"
@@ -317,7 +335,7 @@ def build_existing_map():
             if igid:
                 by_igid.setdefault(igid, []).append(p)
         m = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', r.headers.get("Link",""))
-        path = f"products.json?limit=250&fields=id,tags,created_at,variants&page_info={m.group(1)}" if m else None
+        path = f"products.json?limit=250&fields={_SCAN_FIELDS}&page_info={m.group(1)}" if m else None
         time.sleep(0.5)  # was 0.1 — too fast for REST limit, contributed to the 429s
 
     product_map, dup_groups, dup_total = {}, 0, 0
@@ -325,8 +343,10 @@ def build_existing_map():
         products.sort(key=lambda p: p.get("created_at", ""))  # oldest first
         canonical = products[0]
         product_map[igid] = {
-            "id": canonical["id"],
-            "variants": {v["sku"]: v["id"] for v in canonical.get("variants", []) if v.get("sku")},
+            "id":       canonical["id"],
+            "status":   canonical.get("status"),
+            "variants": {v["sku"]: _variant_state(v)
+                         for v in canonical.get("variants", []) if v.get("sku")},
         }
         if len(products) > 1:
             dup_groups += 1
@@ -339,7 +359,7 @@ def build_existing_map():
                     f"({dup_total} extra copies beyond the oldest) — "
                     f"these are being updated on the oldest copy only; "
                     f"run the dedupe script to archive the rest.")
-    return product_map
+    return product_map, by_igid
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
@@ -470,6 +490,64 @@ def _apply_variant_extras(variants_response, qtys, costs, lid):
             set_cost(iid, cost)
         time.sleep(0.1)
 
+def _money(x):
+    try:
+        return round(float(x), 2) if x not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+def reconcile_inventory(known_variants, qtys, lid):
+    """
+    Bring each existing Shopify variant's stock to the feed quantity
+    (0 if its SKU is no longer in the in-stock feed). Only calls the API
+    when the number actually differs. Returns how many were changed.
+    """
+    if not lid:
+        return 0
+    changed = 0
+    for sku, cur in known_variants.items():
+        target = int(qtys.get(sku, 0))
+        if cur.get("qty") == target or not cur.get("inventory_item_id"):
+            continue
+        set_inventory(cur["inventory_item_id"], lid, target)
+        changed += 1
+        time.sleep(0.1)
+    return changed
+
+def zero_out_sold_out_products(by_igid, feed_igids, lid):
+    """
+    FIX (the actual bug): products whose item_group_id is no longer in the
+    Channable feed are sold out at the supplier. The old script only looped
+    over feed rows with quantity >= 1, so these products were never touched
+    again and stayed buyable in Shopify forever.
+
+    They are set to 0 stock (not deleted/drafted), so the product page and
+    SEO stay, it shows as sold out, and it comes back automatically if the
+    supplier restocks it (it then reappears in the feed and gets its qty).
+    """
+    orphans = [ig for ig in by_igid if ig not in feed_igids]
+    # Safety net: if the feed suddenly shrank to a fraction of what's in the
+    # shop, it's almost certainly a broken/partial feed, not a sell-out wave.
+    if by_igid and len(feed_igids) < 0.5 * len(by_igid):
+        log.error(f"  ⛔ Feed has only {len(feed_igids)} products vs {len(by_igid)} in Shopify "
+                  f"— looks like a partial feed. NOT zeroing {len(orphans)} products this run.")
+        return 0
+    zeroed_products = zeroed_variants = 0
+    for ig in orphans:
+        hit = False
+        for p in by_igid[ig]:
+            for v in p.get("variants", []):
+                if (v.get("inventory_quantity") or 0) > 0 and v.get("inventory_item_id"):
+                    set_inventory(v["inventory_item_id"], lid, 0)
+                    zeroed_variants += 1; hit = True
+                    time.sleep(0.1)
+        if hit:
+            zeroed_products += 1
+            log.info(f"    🚫 SOLD OUT at supplier → stock 0  '{ig}'")
+    log.info(f"  Sold-out check: {len(orphans)} synced products no longer in feed · "
+             f"{zeroed_products} products / {zeroed_variants} variants set to 0")
+    return zeroed_products
+
 def create_product(payload, lid):
     qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
     costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
@@ -510,7 +588,7 @@ def update_product(entry, payload, lid, light=False):
 
     for v in payload["variants"]:
         if v["sku"] in known_variants:
-            v["id"] = known_variants[v["sku"]]
+            v["id"] = known_variants[v["sku"]]["id"]
         # else: brand-new variant on an existing product (e.g. new size added)
         # — no "id" key means Shopify creates it as part of this PUT.
 
@@ -520,16 +598,39 @@ def update_product(entry, payload, lid, light=False):
         # field set (option values, inventory_management, etc.) to be created
         # correctly — sending it stripped-down here could create a malformed
         # variant. Defer it to the daily full sync instead.
-        light_variants = [
-            {k: v[k] for k in ("id","sku","price","compare_at_price","barcode") if k in v}
-            for v in payload["variants"] if "id" in v
-        ]
-        skipped_variants = len(payload["variants"]) - len(light_variants)
+        #
+        # FIX (speed): only send variants whose price / compare-at / barcode
+        # actually differ from what the scan saw, and skip the PUT entirely
+        # when nothing changed. Most products don't change hour to hour, so
+        # this turns ~1,000 PUTs into a handful and lets the run finish.
+        light_variants = []
+        for v in payload["variants"]:
+            if "id" not in v:
+                continue
+            cur = known_variants[v["sku"]]
+            if (_money(cur["price"]) != _money(v["price"]) or
+                _money(cur["compare_at_price"]) != _money(v["compare_at_price"]) or
+                (cur["barcode"] or "") != (v.get("barcode") or "")):
+                light_variants.append(
+                    {k: v[k] for k in ("id","sku","price","compare_at_price","barcode") if k in v})
+        skipped_variants = sum(1 for v in payload["variants"] if "id" not in v)
         if skipped_variants:
             log.info(f"    ↪ {skipped_variants} new variant(s) on this product "
                      f"deferred to daily full sync")
-        body = {"id": pid, "status": payload.get("status", "active"),
-                "variants": light_variants}
+        new_status = payload.get("status", "active")
+        if light_variants or entry.get("status") != new_status:
+            body = {"id": pid, "status": new_status, "variants": light_variants}
+            if not shopify("PUT", f"products/{pid}.json", {"product": body}):
+                log.error(f"    ❌ Update failed for product {pid} ('{payload['title']}') — "
+                          f"skipping this run, will retry next sync")
+                return False
+        # FIX (sold-out sizes): sizes that dropped out of the feed are sold out
+        # at the supplier → set them to 0. Before, the fast run only ever
+        # looked at in-stock rows, so a sold-out size kept its old stock.
+        changed_qty = reconcile_inventory(known_variants, qtys, lid)
+        log.info(f"    🔄 UPDATED  '{payload['title']}'  (light · "
+                 f"{len(light_variants)} price chg · {changed_qty} stock chg)")
+        return True
     else:
         body = {
             "id":           pid,
@@ -589,9 +690,14 @@ def run():
     df = fetch_channable()
     if df is None or df.empty: log.error("No feed data — aborting"); return
 
-    product_map = build_existing_map()
+    product_map, by_igid = build_existing_map()
     lid = get_location_id()
     if not lid: sys.exit(1)
+
+    # Runs FIRST (before the long per-product loop) so it always completes,
+    # even if the run later hits the GitHub Actions timeout.
+    feed_igids = set(df["item_group_id"].astype(str))
+    sold_out = zero_out_sold_out_products(by_igid, feed_igids, lid)
 
     if not light:
         # Pre-load taxonomy so it's ready (avoids repeated fetches) — only
@@ -627,7 +733,8 @@ def run():
 
         time.sleep(0.15)
 
-    summary = f"\n  ✅  {created} created · {updated} updated · {errors} errors"
+    summary = (f"\n  ✅  {created} created · {updated} updated · {errors} errors"
+               f" · {sold_out} sold-out products set to 0")
     if light:
         summary += f" · {skipped_new} new products deferred to daily full sync"
     log.info(summary)
