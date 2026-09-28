@@ -28,32 +28,38 @@ SB_KEY        = os.environ.get("VAITTO_SUPABASE_SERVICE_KEY", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-def get_existing_skus(supabase_url: str, service_key: str, supplier_id: str) -> set:
+SWEEP_URL = os.environ.get("VAITTO_SWEEP_URL") or os.environ.get(
+    "VAITTO_HOOK_URL", "https://vaitto.com/api/public/hooks/vaitto-product-import"
+).replace("vaitto-product-import", "vaitto-product-sweep")
+
+
+def get_existing_skus(supplier_id: str) -> set:
     """Fetch the set of vaitto_sku values already in Vaitto for this supplier.
     Used to skip brand-new products in the quick sync — new products should
-    only be created by the full sync, which sends images/category/etc."""
-    if not supabase_url or not service_key:
-        log.warning("  Missing Supabase creds — cannot check existing SKUs, "
-                    "skipping quick sync run to avoid creating incomplete products")
-        sys.exit(1)
-    skus, offset, page = set(), 0, 1000
-    while True:
-        r = requests.get(
-            f"{supabase_url.rstrip('/')}/rest/v1/products",
-            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
-            params={"supplier_id": f"eq.{supplier_id}", "select": "vaitto_sku",
-                    "limit": str(page), "offset": str(offset)},
-            timeout=30,
+    only be created by the full sync, which sends images/category/etc.
+
+    Asks the Vaitto app (vaitto-product-sweep hook, action=list) instead of
+    reading Supabase directly: the VAITTO_SUPABASE_URL secret points at a
+    different project, which made this list incomplete and silently skipped
+    ~130 existing products on every quick run."""
+    try:
+        r = requests.post(
+            SWEEP_URL,
+            headers={"x-hook-secret": os.environ.get("IMPORT_HOOK_SECRET", ""),
+                     "Content-Type": "application/json"},
+            json={"action": "list", "supplier_id": supplier_id},
+            timeout=60,
         )
-        if r.status_code != 200:
-            log.error(f"  Failed to fetch existing SKUs: {r.status_code} {r.text[:300]}")
-            sys.exit(1)
-        rows = r.json()
-        skus.update(row["vaitto_sku"] for row in rows if row.get("vaitto_sku"))
-        if len(rows) < page:
-            break
-        offset += page
-    return skus
+        res = r.json()
+    except Exception as e:
+        log.error(f"  Failed to fetch existing SKUs: {e}")
+        sys.exit(1)
+    if r.status_code != 200 or not res.get("ok"):
+        # Never guess: without the list we can't tell new from existing, and
+        # sending new products here would create them without images/category.
+        log.error(f"  Failed to fetch existing SKUs: HTTP {r.status_code} {str(res)[:300]}")
+        sys.exit(1)
+    return set(res.get("skus") or [])
 
 
 def run():
@@ -67,7 +73,7 @@ def run():
     brands = load_brands(SB_URL, SB_KEY)
     log.info(f"  {len(brands)} brands loaded")
 
-    existing_skus = get_existing_skus(SB_URL, SB_KEY, SUPPLIER_ID)
+    existing_skus = get_existing_skus(SUPPLIER_ID)
     log.info(f"  {len(existing_skus)} existing SKUs found — new products will be skipped "
              f"(handled by full sync instead)")
 

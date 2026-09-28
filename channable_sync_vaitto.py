@@ -27,91 +27,55 @@ def _clean(v) -> str:
 
 
 
-MIN_FEED_RATIO = 0.5   # abort the sweep if the feed shrank by more than half
+# The sweep runs server-side in the Vaitto app (vaitto-product-sweep hook),
+# NOT via direct Supabase access: the VAITTO_SUPABASE_URL secret points at a
+# different project, so the old direct sweep aborted on every run and
+# sold-out products stayed buyable. The hook uses the app's own DB client,
+# keeps the >=50% truncated-feed guard and never touches products with
+# manually booked return stock.
+SWEEP_URL = os.environ.get("VAITTO_SWEEP_URL") or os.environ.get(
+    "VAITTO_HOOK_URL", "https://vaitto.com/api/public/hooks/vaitto-product-import"
+).replace("vaitto-product-import", "vaitto-product-sweep")
 
 
 def deactivate_missing(seen_skus: set, dry_run: bool) -> None:
-    """Deactivate this supplier's active products that are no longer in the feed.
-
-    Tluxy drops products from the feed entirely rather than sending them at
-    stock 0, so the webhook's own deactivation path never sees them and they
-    stay buyable forever. Products carrying manually booked return stock are
-    left alone: that stock is physically in Hanau and has nothing to do with
-    what the supplier still lists.
-    """
-    if not SB_URL or not SB_KEY:
-        log.warning("  Sweep skipped: no Supabase credentials")
-        return
-
-    headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
-    active, offset, page = [], 0, 1000
-    while True:
-        r = requests.get(
-            f"{SB_URL.rstrip('/')}/rest/v1/products",
-            headers=headers,
-            params={"select": "id,vaitto_sku,name,returned_qty",
-                    "supplier_id": f"eq.{SUPPLIER_ID}", "active": "eq.true",
-                    "limit": str(page), "offset": str(offset)},
-            timeout=60,
+    """Ask Vaitto to deactivate this supplier's active products that are no
+    longer in the feed (Tluxy drops sold-out products from the feed entirely
+    instead of sending them at stock 0)."""
+    secret = os.environ.get("IMPORT_HOOK_SECRET", "")
+    try:
+        r = requests.post(
+            SWEEP_URL,
+            headers={"x-hook-secret": secret, "Content-Type": "application/json"},
+            json={"action": "sweep", "supplier_id": SUPPLIER_ID,
+                  "seen_skus": sorted(str(s) for s in seen_skus),
+                  "dry_run": bool(dry_run)},
+            timeout=120,
         )
-        if r.status_code != 200:
-            log.error(f"  Sweep aborted — could not list products: "
-                      f"{r.status_code} {r.text[:300]}")
-            return
-        rows = r.json()
-        active.extend(rows)
-        if len(rows) < page:
-            break
-        offset += page
-
-    if not active:
+    except requests.RequestException as e:
+        log.error(f"  Sweep failed — network error: {e}")
+        return
+    try:
+        res = r.json()
+    except Exception:
+        log.error(f"  Sweep failed — HTTP {r.status_code}: {r.text[:300]}")
+        return
+    if r.status_code == 409 or res.get("aborted"):
+        log.error(f"  ⛔  Sweep aborted by Vaitto: {res.get('error')}")
+        return
+    if r.status_code != 200:
+        log.error(f"  Sweep failed — HTTP {r.status_code}: {res.get('error') or res}")
         return
 
-    # A truncated download is the one way this does real damage. If the feed
-    # carries less than half of what is currently active, something is wrong
-    # with the feed rather than with the catalogue — leave it alone.
-    ratio = len(seen_skus) / len(active)
-    if ratio < MIN_FEED_RATIO:
-        log.error(f"  ⛔  Sweep aborted — feed has {len(seen_skus)} products vs "
-                  f"{len(active)} active ({ratio:.0%}). Suspected truncated feed.")
-        return
-
-    stale = [p for p in active if p["vaitto_sku"] not in seen_skus]
-    kept  = [p for p in stale if (p.get("returned_qty") or 0) > 0]
-    drop  = [p for p in stale if (p.get("returned_qty") or 0) == 0]
-
-    for p in kept:
-        log.info(f"  ↩️  keeping {p['vaitto_sku']}  '{p['name']}'  "
-                 f"(returned_qty={p['returned_qty']})")
-    for p in drop:
-        log.info(f"  🔻 {'[DRY RUN] would deactivate' if dry_run else 'deactivating'}"
-                 f"  {p['vaitto_sku']}  '{p['name']}'")
-
-    if not drop:
-        log.info("  Sweep: nothing to deactivate")
-        return
-    if dry_run:
-        log.info(f"  [DRY RUN] would deactivate {len(drop)} products")
-        return
-
-    failed = 0
-    for i in range(0, len(drop), 50):
-        chunk = drop[i:i + 50]
-        ids = ",".join(p["id"] for p in chunk)
-        r = requests.patch(
-            f"{SB_URL.rstrip('/')}/rest/v1/products",
-            headers={**headers, "Content-Type": "application/json",
-                     "Prefer": "return=minimal"},
-            params={"id": f"in.({ids})"},
-            json={"active": False},
-            timeout=60,
-        )
-        if r.status_code not in (200, 204):
-            failed += len(chunk)
-            log.error(f"  Sweep chunk failed: {r.status_code} {r.text[:300]}")
-
-    log.info(f"  Sweep: {len(drop) - failed} deactivated, {len(kept)} kept "
-             f"(return stock), {failed} failed")
+    for p in res.get("stale", []):
+        log.info(f"  🔻 {'[DRY RUN] would deactivate' if dry_run else 'deactivated'}"
+                 f"  {p.get('vaitto_sku')}  '{p.get('name')}'")
+    for sku in res.get("kept_skus", []):
+        log.info(f"  ↩️  kept {sku} (return stock)")
+    n = res.get("would_deactivate") if dry_run else res.get("deactivated")
+    log.info(f"  Sweep: {res.get('active')} active · {res.get('seen')} in feed · "
+             f"{n} {'would be ' if dry_run else ''}deactivated · {res.get('kept')} kept (return stock)"
+             + (f" · errors: {res.get('errors')}" if res.get("errors") else ""))
 
 
 
