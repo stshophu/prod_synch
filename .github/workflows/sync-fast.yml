@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '0 * * * *'   # every hour, on the hour
   workflow_dispatch:        # also lets you click "Run workflow" manually in GitHub
+# Only one Shopify sync at a time. Overlapping runs share the same API
+# rate limit, slow each other down to ~10s/product and then BOTH time out.
+concurrency:
+  group: shopify-channable-sync
+  cancel-in-progress: false
 jobs:
   sync:
     runs-on: ubuntu-latest
