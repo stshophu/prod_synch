@@ -8,7 +8,7 @@ Channable → Shopify Auto-Sync
 • Sets cost per item (wholesale price) on every variant
 
 Pricing (margin-based, calculated from actual wholesale cost):
-  Shopify compare-at    = Channable 'retail_price EUR'  (RRP)
+  Shopify compare-at    = none (cleared; supplier RRP is its own shop price)
   Shopify selling price = calculated for TARGET_MARGIN after VAT
   Shopify cost per item = Channable 'wholesale_ EUR'
 """
@@ -444,7 +444,9 @@ def build_payload(group, igid, light=False):
         wkg = default_weight_kg(sub_cat, str(first.get("title", "")))
         v = {"sku":                  str(row["sku"]),
              "price":                f"{selling_price:.2f}",
-             "compare_at_price":     f"{float(row['retail_price EUR']):.2f}",
+             # No strikethrough: the Channable/Tluxy "RRP" is the supplier's own shop
+             # price, which Google Merchant Center treats as a misleading discount.
+             "compare_at_price":     None,
              "barcode":              gtin if valid_gtin(gtin) else "",
              "inventory_management": "shopify",
              "inventory_policy":     "deny",
