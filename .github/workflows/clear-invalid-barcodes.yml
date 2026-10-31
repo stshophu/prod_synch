@@ -1,0 +1,32 @@
+name: Clear invalid barcodes (manual, one-off)
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually clear them? (false = dry run, only lists them)"
+        type: boolean
+        default: false
+concurrency:
+  group: shopify-channable-sync
+  cancel-in-progress: false
+jobs:
+  clear:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scan and clear
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: siebentaschen.myshopify.com
+        run: python clear_invalid_barcodes.py ${{ inputs.apply && '--apply' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: invalid-barcodes
+          path: invalid_barcodes.csv
