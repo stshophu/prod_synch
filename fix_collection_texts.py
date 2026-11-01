@@ -19,7 +19,7 @@ import requests
 
 STORE = os.getenv("SHOPIFY_STORE", "siebentaschen.myshopify.com")
 TOKEN = os.getenv("SHOPIFY_TOKEN", "")
-URL = f"https://{STORE}/admin/api/2024-10/graphql.json"
+URL = f"https://{STORE}/admin/api/2026-10/graphql.json"  # new collection model needs collectionUpdate(collection:)
 APPLY = "--apply" in sys.argv
 S = requests.Session()
 S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"})
@@ -78,8 +78,8 @@ def main():
         return
     errors = 0
     for cid, h, new in todo:
-        res = gql("""mutation($input: CollectionInput!) { collectionUpdate(input: $input) {
-            userErrors { field message } } }""", {"input": {"id": cid, "descriptionHtml": new}})
+        res = gql("""mutation($c: CollectionUpdateInput!) { collectionUpdate(collection: $c) {
+            userErrors { field message } } }""", {"c": {"id": cid, "descriptionHtml": new}})
         if res["collectionUpdate"]["userErrors"]:
             errors += 1
             print("ERROR", h, res["collectionUpdate"]["userErrors"])
