@@ -1,0 +1,23 @@
+name: Fix collection texts (manual, one-off)
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually update collections? (false = dry run)"
+        type: boolean
+        default: false
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Fix collection texts
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: siebentaschen.myshopify.com
+        run: python fix_collection_texts.py ${{ inputs.apply && '--apply' || '' }}
