@@ -32,6 +32,9 @@ REPLACEMENTS = [
      "with delivery across Europe and worldwide."),
     (re.compile(r"All pieces at Siebentaschen are past-season designer items, sourced through established Italian distributors and offered below their original retail price\."),
      "Pieces at Siebentaschen are sourced through established Italian wholesale distributors and offered below their original retail price."),
+    # Positive, non-alarming independence note (Nov 2026)
+    (re.compile(r"Siebentaschen is an independent reseller and is not affiliated with, sponsored by or endorsed by ([^.<]+)\. All trademarks belong to their respective owners\."),
+     r"Siebentaschen is an independent multi-brand retailer, not an official \1 boutique. All brand names belong to their respective owners."),
 ]
 
 
