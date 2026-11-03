@@ -1,0 +1,36 @@
+name: SEO backfill — titles, descriptions, alt texts (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually write the changes? (false = dry run, only writes seo_preview.csv)"
+        type: boolean
+        default: false
+      limit:
+        description: "Only the first N products that need changes (0 = all)"
+        type: string
+        default: "0"
+concurrency:
+  group: shopify-seo-backfill
+  cancel-in-progress: false
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Fill empty SEO fields and alt texts
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: siebentaschen.myshopify.com
+        run: python seo_backfill.py --limit ${{ inputs.limit }} ${{ inputs.apply && '--apply' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seo-preview
+          path: seo_preview.csv
