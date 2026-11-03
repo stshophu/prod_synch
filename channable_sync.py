@@ -652,9 +652,10 @@ def update_product(entry, payload, lid, light=False):
                  f"{len(light_variants)} price chg · {changed_qty} stock chg)")
         return True
     else:
+        # Title is set once at creation and never overwritten here, so titles
+        # edited in Shopify (SEO work, Nov 2026) survive the daily full sync.
         body = {
             "id":           pid,
-            "title":        payload["title"],
             "body_html":    payload["body_html"],
             "vendor":       payload["vendor"],
             "product_type": payload["product_type"],
@@ -689,7 +690,7 @@ def update_product(entry, payload, lid, light=False):
 #   finish well inside 60 minutes.
 #
 #   SYNC_MODE=full (daily) — the original full behavior: creates new
-#   products, and does a complete field sync (title/vendor/tags/body_html/
+#   products, and does a complete field sync (vendor/tags/body_html/
 #   category/images) on existing ones. Runs once a day on a longer timeout
 #   since it's the expensive pass.
 
