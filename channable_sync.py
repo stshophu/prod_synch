@@ -173,6 +173,16 @@ def shopify(method, path, body=None, retries=8):
             time.sleep(2 ** attempt)
     return None
 
+def set_rrp_metafield(product_id, rrp):
+    """Italian retail price as product metafield custom.rrp: shown in the shop as
+    plain information ("UVP des Herstellers"), never crossed out, never sent to Google."""
+    if not product_id or not rrp or float(rrp) <= 0:
+        return
+    q = "mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }"
+    shopify("POST", "graphql.json", {"query": q, "variables": {"m": [{
+        "ownerId": f"gid://shopify/Product/{product_id}", "namespace": "custom",
+        "key": "rrp", "type": "number_decimal", "value": f"{float(rrp):.2f}"}]}})
+
 def get_location_id():
     d = shopify("GET", "locations.json")
     return d["locations"][0]["id"] if d and d.get("locations") else None
@@ -474,7 +484,10 @@ def build_payload(group, igid, light=False):
     ]
     tags = ", ".join(filter(None, tag_parts))
 
+    rrps = [float(r) for r in group["retail_price EUR"] if pd.notna(r) and r and float(r) > 0] \
+        if "retail_price EUR" in group else []
     payload = {
+        "_rrp":         max(rrps) if rrps else None,
         "title":        str(first["title"]),
         "body_html":    html_desc(first.get("description","")),
         "vendor":       vendor.upper(),
@@ -569,6 +582,7 @@ def zero_out_sold_out_products(by_igid, feed_igids, lid):
     return zeroed_products
 
 def create_product(payload, lid):
+    rrp = payload.pop("_rrp", None)
     qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
     costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
     for v in payload["variants"]: v.pop("_feed", None)
@@ -578,6 +592,7 @@ def create_product(payload, lid):
 
     p = result["product"]
     _apply_variant_extras(p["variants"], qtys, costs, lid)
+    set_rrp_metafield(p["id"], rrp)
     log.info(f"    ✅ CREATED  '{payload['title']}'  ({len(p['variants'])} variants)")
     return p["id"]
 
@@ -601,6 +616,9 @@ def update_product(entry, payload, lid, light=False):
     """
     pid = entry["id"]
     known_variants = entry.get("variants", {})
+    rrp = payload.pop("_rrp", None)
+    if not light:
+        set_rrp_metafield(pid, rrp)   # daily full run keeps the UVP current
 
     qtys  = {v["sku"]: v.pop("_qty",  0)    for v in payload["variants"]}
     costs = {v["sku"]: v.pop("_cost", None) for v in payload["variants"]}
