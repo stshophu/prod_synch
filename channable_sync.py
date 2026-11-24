@@ -499,8 +499,8 @@ def build_payload(group, igid, light=False):
         "images":       [] if light else collect_images(group),
     }
 
-    # Shopify standardized category (taxonomy) — skip in light mode, it's
-    # re-synced by the daily full run and costs a taxonomy lookup either way.
+    # Shopify standardized category (taxonomy) — only used when CREATING a
+    # product; never applied to existing products.
     if not light:
         cat_id = get_category_id(sub_cat)
         if cat_id:
@@ -609,10 +609,10 @@ def update_product(entry, payload, lid, light=False):
     logged/skipped — it can no longer fall through into creating a copy.
 
     light=True (used by the hourly fast sync): only price/compare-at,
-    barcode, status and the inventory/cost side-calls are touched. Title,
-    vendor, tags, body_html, product_type and taxonomy are left untouched —
-    they're re-synced fully by the daily full run. This cuts payload size
-    and API calls considerably for the run that has to finish in an hour.
+    barcode, status and the inventory/cost side-calls are touched.
+    light=False (daily full run): same fields, plus new sizes on existing
+    products. Neither mode overwrites title, vendor, tags, body_html,
+    product_type or category of existing products.
     """
     pid = entry["id"]
     known_variants = entry.get("variants", {})
@@ -672,17 +672,14 @@ def update_product(entry, payload, lid, light=False):
     else:
         # Title is set once at creation and never overwritten here, so titles
         # edited in Shopify (SEO work, Nov 2026) survive the daily full sync.
+        # Existing products: ONLY price/stock-side fields (variants incl. new
+        # sizes, status, cost, inventory). Description, vendor, product type,
+        # tags and category are set once at creation and never overwritten,
+        # so hand-maintained values survive the daily run (Nov 2026).
         body = {
             "id":           pid,
-            "body_html":    payload["body_html"],
-            "vendor":       payload["vendor"],
-            "product_type": payload["product_type"],
-            "tags":         payload["tags"],
             "status":       payload.get("status","active"),
             "variants":     payload["variants"],
-            # Skip images on update — they rarely change and save API time
-            **({"product_category": payload["product_category"]}
-               if "product_category" in payload else {}),
         }
 
     result = shopify("PUT", f"products/{pid}.json", {"product": body})
@@ -707,10 +704,9 @@ def update_product(entry, payload, lid, light=False):
 #   data that actually needs to be fresh every hour, and it's light enough to
 #   finish well inside 60 minutes.
 #
-#   SYNC_MODE=full (daily) — the original full behavior: creates new
-#   products, and does a complete field sync (vendor/tags/body_html/
-#   category/images) on existing ones. Runs once a day on a longer timeout
-#   since it's the expensive pass.
+#   SYNC_MODE=full (daily) — creates new products (all fields) and, for
+#   existing products, updates only price/stock (incl. new sizes). It never
+#   overwrites description, vendor, product type, tags or category.
 
 SYNC_MODE = os.getenv("SYNC_MODE", "full").strip().lower()
 
