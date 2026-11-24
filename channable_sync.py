@@ -672,17 +672,19 @@ def update_product(entry, payload, lid, light=False):
     else:
         # Title is set once at creation and never overwritten here, so titles
         # edited in Shopify (SEO work, Nov 2026) survive the daily full sync.
+        # Existing products: only price/stock side. Description, vendor, product
+        # type, category and tags are NOT overwritten (edited in Shopify).
+        # Known variants get price, compare-at and barcode only; brand-new
+        # variants (e.g. a new size) are sent with the full field set so
+        # Shopify can create them correctly.
         body = {
             "id":           pid,
-            "body_html":    payload["body_html"],
-            "vendor":       payload["vendor"],
-            "product_type": payload["product_type"],
-            "tags":         payload["tags"],
             "status":       payload.get("status","active"),
-            "variants":     payload["variants"],
-            # Skip images on update — they rarely change and save API time
-            **({"product_category": payload["product_category"]}
-               if "product_category" in payload else {}),
+            "variants":     [
+                ({k: v[k] for k in ("id","sku","price","compare_at_price","barcode") if k in v}
+                 if "id" in v else v)
+                for v in payload["variants"]
+            ],
         }
 
     result = shopify("PUT", f"products/{pid}.json", {"product": body})
