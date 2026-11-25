@@ -27,6 +27,12 @@ jobs:
       - name: Run sync (fast — price/inventory only, no creates)
         env:
           SYNC_MODE: fast
+          PRICE_RULE: ${{ vars.PRICE_RULE || 'legacy' }}
+          MIN_PROFIT_EUR: ${{ vars.MIN_PROFIT_EUR }}
+          SHIP_COST_DE: ${{ vars.SHIP_COST_DE }}
+          SHIP_PAID_DE: ${{ vars.SHIP_PAID_DE }}
+          EXTRA_COST_ORDER: ${{ vars.EXTRA_COST_ORDER }}
+          BEYOND_SHORTFALL: ${{ vars.BEYOND_SHORTFALL }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_STORE: siebentaschen.myshopify.com
           CHANNABLE_URL: ${{ secrets.CHANNABLE_URL }}
