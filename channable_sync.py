@@ -157,6 +157,7 @@ FREE_SHIP_FROM    = _envf("FREE_SHIP_FROM", "150")
 EXTRA_COST_ORDER  = _envf("EXTRA_COST_ORDER", "0")      # packaging etc.
 BEYOND_COMMISSION = _envf("BEYOND_COMMISSION", "0.15")
 BEYOND_SHORTFALL  = _envf("BEYOND_SHORTFALL", "0")      # DHL cost to HK minus the 50 EUR paid
+MAX_OVER_UVP      = _envf("MAX_OVER_UVP", "0.30")   # floor rule: hold items whose floor price is > UVP x (1+this)
 BEYOND_ENABLED    = os.getenv("BEYOND_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 
 def min_profit_price(cost):
@@ -184,7 +185,8 @@ def floor_price_decision(wholesale, rrp, supplier_price):
     info = {"supplier_price": base, "floor_price": round(floor, 2), "new_price": round(price, 2),
             "decision": "no-supplier-price" if base is None else ("raised" if price > base + 0.005 else "keep"),
             "raise_pct": round((price / base - 1) * 100, 1) if base else None,
-            "above_rrp": bool(rrp and price > rrp)}
+            "above_rrp": bool(rrp and price > rrp),
+            "hold": bool(rrp and MAX_OVER_UVP > 0 and price > rrp * (1 + MAX_OVER_UVP))}
     return price, info
 
 # Keep backward-compatible wrapper
@@ -481,6 +483,7 @@ def build_payload(group, igid, light=False):
     variants = []
     product_status = "active"
     margin_tag = None
+    hold = False   # floor rule: floor price > UVP ceiling -> not sold (never created; existing -> draft)
 
     for _, row in group.iterrows():
         gtin = str(row.get("gtin","")).split(".")[0].strip()
@@ -496,7 +499,9 @@ def build_payload(group, igid, light=False):
             if PRICE_RULE == "floor":
                 price, _info = floor_price_decision(float(wholesale), float(rrp),
                                                    float(row.get("compare at price", 0) or 0))
-                status, tag = 'ok', None   # floor rule never unpublishes or tags low-margin
+                status, tag = 'ok', None   # floor rule never uses the legacy low-margin/review states
+                if _info["hold"]:
+                    hold = True
             if price:
                 selling_price = price
             if status == 'review-margin':
@@ -528,6 +533,10 @@ def build_payload(group, igid, light=False):
     options = ([{"name":"Color","values":colors},{"name":"Size","values":sizes}]
                if multi_c else [{"name":"Size","values":sizes}])
 
+    if hold:
+        product_status = "draft"
+        margin_tag = "price-hold"
+
     tag_parts = [
         str(first.get("category","")).strip(),
         sub_cat,
@@ -548,6 +557,7 @@ def build_payload(group, igid, light=False):
         "product_type": sub_cat,
         "tags":         tags,
         "status":       product_status,  # 'draft' if review-margin, else 'active'
+        "_hold":        hold,
         "options":      options,
         "variants":     variants,
         "images":       [] if light else collect_images(group),
@@ -790,7 +800,8 @@ def dry_run_report(df, out="dry_run_prices.csv"):
         rows.append({"sku": sku, "vendor": r.get("vendor", ""), "title": str(r.get("title", ""))[:60],
                      "cost": round(float(w), 2), "uvp": rrp or "", "current_shopify": cur or "",
                      "legacy_formula": legacy or "", **info,
-                     "over_10pct": (info["raise_pct"] or 0) > 10, "over_30pct": (info["raise_pct"] or 0) > 30})
+                     "over_10pct": (info["raise_pct"] or 0) > 10, "over_30pct": (info["raise_pct"] or 0) > 30,
+                     "in_shopify": bool(cur)})
     with open(out, "w", newline="", encoding="utf-8") as f:
         w_ = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["empty"])
         w_.writeheader(); w_.writerows(rows)
@@ -799,7 +810,9 @@ def dry_run_report(df, out="dry_run_prices.csv"):
     log.info(f"  DRY RUN: {len(rows)} variants → {out}")
     log.info(f"    keep={cnt('keep')} raised={cnt('raised')} no-supplier-price={cnt('no-supplier-price')}"
              f" · >10%={sum(x['over_10pct'] for x in rows)} · >30%={sum(x['over_30pct'] for x in rows)}"
-             f" · above UVP={sum(x['above_rrp'] for x in rows)}")
+             f" · above UVP={sum(x['above_rrp'] for x in rows)}"
+             f" · HOLD (floor > UVP+{MAX_OVER_UVP:.0%}): {sum(x['hold'] for x in rows)}"
+             f" (of which already in shop: {sum(x['hold'] and x['in_shopify'] for x in rows)})")
     log.info(f"    assumptions: min_profit={MIN_PROFIT_EUR} ship_de={SHIP_COST_DE} paid={SHIP_PAID_DE} "
              f"pay={PAY_FEE_PCT}+{PAY_FEE_FIXED} beyond={BEYOND_ENABLED}/{BEYOND_COMMISSION}/{BEYOND_SHORTFALL}")
 
@@ -848,13 +861,17 @@ def run():
         except Exception as e:
             log.error(f"[{i}/{total}] Build error {igid}: {e}"); errors += 1; continue
 
-        log.info(f"[{i}/{total}] {igid}  →  '{payload['title']}'")
+        held = payload.pop("_hold", False)
+        log.info(f"[{i}/{total}] {igid}  →  '{payload['title']}'" + ("  [price-hold]" if held else ""))
 
         if igid in product_map:
             if update_product(product_map[igid], payload, lid, light=light):
                 updated += 1
             else:
                 errors += 1
+        elif held:
+            # Floor price is above the UVP ceiling: do not create the product at all.
+            skipped_new += 1
         elif light:
             # Fast mode never creates — new products wait for the daily full
             # run, which also re-scans and would otherwise race the same igid.
