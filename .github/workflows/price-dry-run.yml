@@ -1,0 +1,56 @@
+name: Price rule DRY RUN (Tluxy) - no Shopify writes
+on:
+  workflow_dispatch:
+    inputs:
+      min_profit:
+        description: "Minimum profit per item (EUR)"
+        default: "40"
+      ship_cost_de:
+        description: "DHL cost per parcel to Germany (EUR)"
+        default: "10"
+      beyond_shortfall:
+        description: "Beyond: DHL cost to Hong Kong minus the 50 EUR the buyer pays (EUR)"
+        default: "0"
+      extra_cost:
+        description: "Other fixed cost per order (EUR)"
+        default: "0"
+# Same group as the live syncs so this never overlaps with them (shared API rate limit).
+concurrency:
+  group: shopify-channable-sync
+  cancel-in-progress: false
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Dry run (reads feed + current prices, writes a CSV only)
+        env:
+          DRY_RUN: "1"
+          PRICE_RULE: floor
+          MIN_PROFIT_EUR: ${{ inputs.min_profit }}
+          SHIP_COST_DE: ${{ inputs.ship_cost_de }}
+          BEYOND_SHORTFALL: ${{ inputs.beyond_shortfall }}
+          EXTRA_COST_ORDER: ${{ inputs.extra_cost }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: siebentaschen.myshopify.com
+          CHANNABLE_URL: ${{ secrets.CHANNABLE_URL }}
+          TARGET_MARGIN: ${{ secrets.TARGET_MARGIN }}
+          VAT_RATE: ${{ secrets.VAT_RATE }}
+          MAX_DISC_DEFAULT: ${{ secrets.MAX_DISC_DEFAULT }}
+          MAX_DISC_HALO: ${{ secrets.MAX_DISC_HALO }}
+          MAX_DISC_SHOE: ${{ secrets.MAX_DISC_SHOE }}
+          MIN_ACCEPTABLE_MARGIN: ${{ secrets.MIN_ACCEPTABLE_MARGIN }}
+          HALO_BRANDS: ${{ secrets.HALO_BRANDS }}
+          SHOE_BRANDS: ${{ secrets.SHOE_BRANDS }}
+        run: python channable_sync.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tluxy-dry-run-prices
+          path: dry_run_prices.csv
+          retention-days: 7

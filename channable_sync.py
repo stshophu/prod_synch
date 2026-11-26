@@ -137,6 +137,56 @@ def price_decision(wholesale, rrp, vendor=""):
     price = min(price, rrp * 0.95)  # max 5% discount shown (keeps it looking premium)
     return round(price / 5) * 5 or round(min_viable / 5) * 5, 'ok', None
 
+
+# ── Floor pricing rule (opt-in; default OFF so live prices are unchanged) ─────
+#   PRICE_RULE=floor  → price = max(supplier discounted price, min-profit price)
+#   DRY_RUN=1         → no Shopify writes; writes dry_run_prices.csv instead
+# Every cost below is an ASSUMPTION until confirmed against real invoices.
+def _envf(name, default):
+    v = os.getenv(name, "").strip()
+    return float(v) if v else float(default)
+
+PRICE_RULE        = (os.getenv("PRICE_RULE", "") or "legacy").strip().lower()
+DRY_RUN           = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+MIN_PROFIT_EUR    = _envf("MIN_PROFIT_EUR", "40")
+PAY_FEE_PCT       = _envf("PAY_FEE_PCT", "0.025")  # of gross
+PAY_FEE_FIXED     = _envf("PAY_FEE_FIXED", "0.30")
+SHIP_COST_DE      = _envf("SHIP_COST_DE", "10")     # what DHL costs us
+SHIP_PAID_DE      = _envf("SHIP_PAID_DE", "6.95")   # what the customer pays
+FREE_SHIP_FROM    = _envf("FREE_SHIP_FROM", "150")
+EXTRA_COST_ORDER  = _envf("EXTRA_COST_ORDER", "0")      # packaging etc.
+BEYOND_COMMISSION = _envf("BEYOND_COMMISSION", "0.15")
+BEYOND_SHORTFALL  = _envf("BEYOND_SHORTFALL", "0")      # DHL cost to HK minus the 50 EUR paid
+BEYOND_ENABLED    = os.getenv("BEYOND_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+
+def min_profit_price(cost):
+    """Lowest shop price (gross, EUR) that still earns MIN_PROFIT_EUR on this
+    item in Germany and, if BEYOND_ENABLED, on Beyond (same price everywhere)."""
+    base = cost + MIN_PROFIT_EUR + PAY_FEE_FIXED + EXTRA_COST_ORDER
+    k = 1 / (1 + VAT_RATE) - PAY_FEE_PCT
+    p = (base + SHIP_COST_DE - SHIP_PAID_DE / (1 + VAT_RATE)) / k
+    if p >= FREE_SHIP_FROM:                      # customer pays no shipping above threshold
+        p = (base + SHIP_COST_DE) / k
+    if BEYOND_ENABLED:
+        p = max(p, (cost + MIN_PROFIT_EUR + EXTRA_COST_ORDER + BEYOND_SHORTFALL) / (1 - BEYOND_COMMISSION))
+    return p
+
+def _ceil5(x):
+    return int(-(-x // 5) * 5)
+
+def floor_price_decision(wholesale, rrp, supplier_price):
+    """Returns (price, info). price = max(supplier price, min-profit price), rounded UP to 5."""
+    floor = min_profit_price(wholesale)
+    base  = supplier_price if supplier_price and supplier_price > 0 else None
+    # The supplier price is used EXACTLY when it already clears the floor;
+    # only a raised (floor) price is rounded up to the next 5 EUR.
+    price = float(base) if base and base >= floor else _ceil5(floor)
+    info = {"supplier_price": base, "floor_price": round(floor, 2), "new_price": round(price, 2),
+            "decision": "no-supplier-price" if base is None else ("raised" if price > base + 0.005 else "keep"),
+            "raise_pct": round((price / base - 1) * 100, 1) if base else None,
+            "above_rrp": bool(rrp and price > rrp)}
+    return price, info
+
 # Keep backward-compatible wrapper
 def calc_selling_price(wholesale, rrp, vendor=""):
     price, _, _ = price_decision(wholesale, rrp, vendor)
@@ -327,7 +377,7 @@ def build_existing_map():
     while path:
         full = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VER}/{path}"
         r = None
-        for attempt in range(6):
+        for attempt in range(25):
             try:
                 r = S.get(full, timeout=30)
             except requests.RequestException as e:
@@ -443,6 +493,10 @@ def build_payload(group, igid, light=False):
         selling_price = float(row.get("compare at price", 0) or 0)  # fallback
         if pd.notna(wholesale) and wholesale and pd.notna(rrp) and rrp:
             price, status, tag = price_decision(float(wholesale), float(rrp), vendor)
+            if PRICE_RULE == "floor":
+                price, _info = floor_price_decision(float(wholesale), float(rrp),
+                                                   float(row.get("compare at price", 0) or 0))
+                status, tag = 'ok', None   # floor rule never unpublishes or tags low-margin
             if price:
                 selling_price = price
             if status == 'review-margin':
@@ -708,10 +762,51 @@ def update_product(entry, payload, lid, light=False):
 #   existing products, updates only price/stock (incl. new sizes). It never
 #   overwrites description, vendor, product type, tags or category.
 
+
+def dry_run_report(df, out="dry_run_prices.csv"):
+    """Log-only: compare current Shopify price, legacy formula and the floor rule
+    per variant. Makes NO Shopify writes."""
+    import csv
+    current = {}
+    if SHOPIFY_TOKEN:
+        try:
+            pm, _ = build_existing_map()
+            for e in pm.values():
+                for sku, v in e["variants"].items():
+                    current[sku] = v.get("price")
+        except Exception as ex:
+            log.warning(f"  Could not read current Shopify prices: {ex}")
+    rows = []
+    for _, r in df.iterrows():
+        w, rrp, sup = r.get("wholesale_ EUR"), r.get("retail_price EUR"), r.get("compare at price")
+        if not (pd.notna(w) and w and w > 0):
+            continue
+        rrp = float(rrp) if pd.notna(rrp) and rrp else 0.0
+        sup = float(sup) if pd.notna(sup) and sup else 0.0
+        legacy = price_decision(float(w), rrp, str(r.get("vendor", "")))[0] if rrp else None
+        _, info = floor_price_decision(float(w), rrp, sup)
+        sku = str(r["sku"])
+        cur = current.get(sku)
+        rows.append({"sku": sku, "vendor": r.get("vendor", ""), "title": str(r.get("title", ""))[:60],
+                     "cost": round(float(w), 2), "uvp": rrp or "", "current_shopify": cur or "",
+                     "legacy_formula": legacy or "", **info,
+                     "over_10pct": (info["raise_pct"] or 0) > 10, "over_30pct": (info["raise_pct"] or 0) > 30})
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w_ = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["empty"])
+        w_.writeheader(); w_.writerows(rows)
+    n = len(rows) or 1
+    cnt = lambda k: sum(1 for x in rows if x["decision"] == k)
+    log.info(f"  DRY RUN: {len(rows)} variants → {out}")
+    log.info(f"    keep={cnt('keep')} raised={cnt('raised')} no-supplier-price={cnt('no-supplier-price')}"
+             f" · >10%={sum(x['over_10pct'] for x in rows)} · >30%={sum(x['over_30pct'] for x in rows)}"
+             f" · above UVP={sum(x['above_rrp'] for x in rows)}")
+    log.info(f"    assumptions: min_profit={MIN_PROFIT_EUR} ship_de={SHIP_COST_DE} paid={SHIP_PAID_DE} "
+             f"pay={PAY_FEE_PCT}+{PAY_FEE_FIXED} beyond={BEYOND_ENABLED}/{BEYOND_COMMISSION}/{BEYOND_SHORTFALL}")
+
 SYNC_MODE = os.getenv("SYNC_MODE", "full").strip().lower()
 
 def run():
-    if not SHOPIFY_TOKEN:
+    if not SHOPIFY_TOKEN and not DRY_RUN:
         log.error("SHOPIFY_TOKEN environment variable not set"); sys.exit(1)
     if not CHANNABLE_URL:
         log.error("CHANNABLE_URL environment variable not set"); sys.exit(1)
@@ -724,6 +819,9 @@ def run():
 
     df = fetch_channable()
     if df is None or df.empty: log.error("No feed data — aborting"); return
+
+    if DRY_RUN:
+        dry_run_report(df); return
 
     product_map, by_igid = build_existing_map()
     lid = get_location_id()
