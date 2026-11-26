@@ -178,9 +178,11 @@ def floor_price_decision(wholesale, rrp, supplier_price):
     """Returns (price, info). price = max(supplier price, min-profit price), rounded UP to 5."""
     floor = min_profit_price(wholesale)
     base  = supplier_price if supplier_price and supplier_price > 0 else None
-    price = _ceil5(max(base or 0, floor))
-    info = {"supplier_price": base, "floor_price": round(floor, 2), "new_price": price,
-            "decision": "no-supplier-price" if base is None else ("raised" if price > base else "keep"),
+    # The supplier price is used EXACTLY when it already clears the floor;
+    # only a raised (floor) price is rounded up to the next 5 EUR.
+    price = float(base) if base and base >= floor else _ceil5(floor)
+    info = {"supplier_price": base, "floor_price": round(floor, 2), "new_price": round(price, 2),
+            "decision": "no-supplier-price" if base is None else ("raised" if price > base + 0.005 else "keep"),
             "raise_pct": round((price / base - 1) * 100, 1) if base else None,
             "above_rrp": bool(rrp and price > rrp)}
     return price, info
